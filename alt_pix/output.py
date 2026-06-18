@@ -31,6 +31,7 @@ def _make_record(
             "conf": round(ball.conf, 3),
             "visible": ball.visible,
             "predicted": ball.predicted,
+            "smoothed": ball.smoothed,
         },
         "players": [
             {
