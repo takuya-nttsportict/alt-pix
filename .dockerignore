@@ -1,0 +1,23 @@
+# Git history (not needed in image)
+.git/
+
+# Large binary artifacts (mount as volumes at runtime)
+models/
+data/
+training/runs/
+
+# Output files
+*.mp4
+*.jsonl
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Editor / OS
+.DS_Store
+*.swp
+.vscode/
+.idea/
