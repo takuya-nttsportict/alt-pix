@@ -1,0 +1,39 @@
+# alt-pix pipeline configuration
+# Override any value with CLI flags (they take precedence).
+
+source: ""                          # SRT/RTMP URL or mp4 path
+
+models:
+  person: models/yolox_m.onnx      # YOLOX-m ONNX (Apache 2.0)
+  ball:   models/yolox_s_ball.onnx # YOLOX-s fine-tuned on volleyball
+
+thresholds:
+  person_conf: 0.40
+  ball_conf:   0.35
+  nms_iou:     0.45
+
+tracking:
+  method:     strongsort            # strongsort | bytetrack
+  reid_model: osnet_x0_25           # osnet_x0_25 (fast) | osnet_ain_x1_0 (accurate)
+  device:     cuda:0
+
+ball:
+  max_miss_frames: 5                # Kalman predict for up to N frames without detection
+
+ocr:
+  enabled:      true
+  use_gpu:      true
+  vote_window:  15                  # majority vote across N frames per track
+
+framing:
+  mode:           auto              # auto | ball | wide
+  output_aspect:  1.7778            # 16/9
+  ema_alpha:      0.15              # smoothing (lower = smoother)
+
+output:
+  json:  null                       # path to .jsonl (null = disabled)
+  video: null                       # path to annotated .mp4 (null = disabled)
+  show:  false                      # display live preview window
+
+performance:
+  skip_frames: 0                    # process every N+1 frames (0 = every frame)

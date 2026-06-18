@@ -1,0 +1,28 @@
+# Stream ingestion
+av>=12.0.0
+
+# Detection: YOLOX (Apache 2.0, Megvii)
+# Install separately: pip install yolox
+# or: pip install git+https://github.com/Megvii-BaseDetection/YOLOX.git
+torch>=2.0.0
+torchvision>=0.15.0
+onnxruntime-gpu>=1.17.0
+
+# Tracking
+# StrongSORT (MIT): pip install git+https://github.com/dyhBUPT/StrongSORT.git
+# or use boxmot which bundles StrongSORT + ByteTrack + OSNet ReID
+boxmot>=10.0.0
+
+# OCR
+paddlepaddle-gpu>=2.6.0
+paddleocr>=2.7.0
+
+# Video processing & visualization
+opencv-python-headless>=4.9.0
+numpy>=1.24.0
+scipy>=1.11.0
+
+# Utilities
+tqdm>=4.66.0
+pyyaml>=6.0
+loguru>=0.7.0
