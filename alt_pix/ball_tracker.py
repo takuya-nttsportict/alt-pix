@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .detector import Detection, _COCO_SPORTS_BALL
+from .trajectory import ParabolicSmoother
 
 MAX_MISS_FRAMES = 5  # frames to keep predicting without a detection
 
@@ -22,7 +23,8 @@ class BallState:
     y: float
     visible: bool
     conf: float
-    predicted: bool  # True when position is Kalman-predicted, not detected
+    predicted: bool   # True when position is Kalman-predicted, not detected
+    smoothed: bool = False  # True when parabolic smoothing was applied
 
 
 class BallKalmanFilter:
@@ -67,18 +69,30 @@ class BallKalmanFilter:
 
 
 class BallTracker:
-    """Combines YOLOX detections with Kalman interpolation."""
+    """Combines YOLOX detections with Kalman interpolation + parabolic smoothing.
 
-    def __init__(self, ball_class_id: int = _COCO_SPORTS_BALL) -> None:
+    Args:
+        ball_class_id: COCO (or custom) class ID that represents the ball.
+        smooth: Enable parabolic trajectory smoother on top of Kalman output.
+    """
+
+    def __init__(
+        self,
+        ball_class_id: int = _COCO_SPORTS_BALL,
+        smooth: bool = True,
+    ) -> None:
         self._cls = ball_class_id
         self._kf = BallKalmanFilter()
+        self._smoother = ParabolicSmoother() if smooth else None
         self._miss = 0
+        self._frame_id = 0
 
     def _best_ball(self, detections: list[Detection]) -> Detection | None:
         balls = [d for d in detections if d.class_id == self._cls]
         return max(balls, key=lambda d: d.conf) if balls else None
 
     def update(self, detections: list[Detection]) -> BallState:
+        self._frame_id += 1
         det = self._best_ball(detections)
 
         if det is not None:
@@ -93,12 +107,23 @@ class BallTracker:
                 px, py = self._kf.update(cx, cy)
 
             self._miss = 0
+
+            if self._smoother is not None:
+                sx, sy = self._smoother.update(self._frame_id, px, py)
+                return BallState(x=sx, y=sy, visible=True, conf=det.conf, predicted=False, smoothed=True)
+
             return BallState(x=px, y=py, visible=True, conf=det.conf, predicted=False)
 
-        # No detection
+        # No detection — Kalman predict
         if self._kf.initialized and self._miss < MAX_MISS_FRAMES:
             px, py = self._kf.predict()
             self._miss += 1
-            return BallState(x=px, y=py, visible=True, conf=0.0, predicted=True)
+
+            if self._smoother is not None:
+                pred = self._smoother.predict(future_frames=self._miss)
+                if pred is not None:
+                    px, py = pred
+
+            return BallState(x=px, y=py, visible=True, conf=0.0, predicted=True, smoothed=self._smoother is not None)
 
         return BallState(x=0.0, y=0.0, visible=False, conf=0.0, predicted=False)
