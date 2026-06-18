@@ -13,9 +13,8 @@ onnxruntime-gpu>=1.17.0
 # or use boxmot which bundles StrongSORT + ByteTrack + OSNet ReID
 boxmot>=10.0.0
 
-# OCR
-paddlepaddle-gpu>=2.6.0
-paddleocr>=2.7.0
+# OCR (EasyOCR: Apache 2.0, numpy 2.x compatible)
+easyocr>=1.7.0
 
 # Video processing & visualization
 opencv-python-headless>=4.9.0
