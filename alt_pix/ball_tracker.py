@@ -35,6 +35,13 @@ MAX_MISS_FRAMES = 25  # frames to keep predicting without a detection.
 # bounces, or is received), so beyond this we declare the ball lost.
 MAX_DISP = 300.0     # max ball displacement between frames (px); WASB default
 QUALITY_WEIGHT = 0.5  # weight of prediction-proximity vs. raw confidence
+# Velocity damping applied to the Kalman state on each predict-only (no
+# detection) step. A spike changes the ball's direction at the exact moment
+# detection is lost, so extrapolating the pre-loss velocity for many frames
+# draws a confidently-wrong path across the court. Damping makes the predicted
+# point coast a few frames in the last direction then settle, bounding the
+# drift to ~1/(1-d) frames of motion regardless of MAX_MISS_FRAMES.
+PRED_VEL_DAMPING = 0.85
 
 
 def _center(det: Detection) -> np.ndarray:
@@ -76,9 +83,14 @@ class BallKalmanFilter:
     def init(self, cx: float, cy: float) -> None:
         self._x = np.array([cx, cy, 0.0, 0.0], dtype=np.float64)
 
-    def predict(self) -> tuple[float, float]:
+    def predict(self, vel_damping: float = 1.0) -> tuple[float, float]:
         assert self._x is not None
         self._x = self._F @ self._x
+        # Damp velocity AFTER advancing position so this step uses the full
+        # velocity and subsequent predict-only steps decelerate.
+        if vel_damping != 1.0:
+            self._x[2] *= vel_damping
+            self._x[3] *= vel_damping
         self._P = self._F @ self._P @ self._F.T + self._Q
         return float(self._x[0]), float(self._x[1])
 
@@ -182,18 +194,19 @@ class BallTracker:
             return BallState(x=px, y=py, visible=True, conf=det.conf, predicted=False)
 
         # No detection — clear motion history (gap breaks the const-accel model)
+        # and reset the smoother so the next fit does not span the gap.
         self._hist.clear()
+        if self._smoother is not None:
+            self._smoother.reset()
 
-        # Kalman predict for a few frames to bridge short gaps
+        # Kalman predict to bridge the gap. Velocity is damped each step so the
+        # marker coasts a few frames in the last direction and then holds,
+        # instead of extrapolating a confidently-wrong path across the court
+        # (a spike reverses the ball's direction at the moment of loss).
+        # The diverging parabolic extrapolation is intentionally NOT used here.
         if self._kf.initialized and self._miss < MAX_MISS_FRAMES:
-            px, py = self._kf.predict()
+            px, py = self._kf.predict(vel_damping=PRED_VEL_DAMPING)
             self._miss += 1
-
-            if self._smoother is not None:
-                pred = self._smoother.predict(future_frames=self._miss)
-                if pred is not None:
-                    px, py = pred
-
-            return BallState(x=px, y=py, visible=True, conf=0.0, predicted=True, smoothed=self._smoother is not None)
+            return BallState(x=px, y=py, visible=True, conf=0.0, predicted=True)
 
         return BallState(x=0.0, y=0.0, visible=False, conf=0.0, predicted=False)
