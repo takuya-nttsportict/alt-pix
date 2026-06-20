@@ -72,7 +72,8 @@ def main() -> None:
     writer: cv2.VideoWriter | None = None
     n_total = 0
     n_raw_hit = 0       # frames with >=1 raw candidate
-    n_track_vis = 0     # frames the tracker reports the ball visible
+    n_track_vis = 0     # frames the tracker reports a DETECTED ball
+    n_track_bridged = 0  # frames the ball is visible incl. Kalman prediction
     trail: deque[tuple[int, int]] = deque(maxlen=25)
     peak_hist = np.zeros(11, dtype=int)  # peak distribution in 0.0..1.0 buckets
 
@@ -107,6 +108,7 @@ def main() -> None:
 
         n_total += 1
         if ball_xy is not None:
+            n_track_bridged += 1
             if not predicted:
                 n_track_vis += 1
             trail.append(ball_xy)
@@ -171,9 +173,10 @@ def main() -> None:
 
         raw_rate = n_raw_hit / n_total * 100
         trk_rate = n_track_vis / n_total * 100
+        bridged_rate = n_track_bridged / n_total * 100
         cv2.putText(vis,
                     f"f={frame_id} cands={len(candidates)} peak={best_peak:.2f} "
-                    f"raw={raw_rate:.0f}% track={trk_rate:.0f}%",
+                    f"raw={raw_rate:.0f}% track={trk_rate:.0f}% bridged={bridged_rate:.0f}%",
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
         combined = np.vstack([vis, hm_canvas])
@@ -184,7 +187,8 @@ def main() -> None:
 
         if n_total % 100 == 0:
             print(f"[f={frame_id:5d}] raw_detect={raw_rate:5.1f}%  "
-                  f"tracked_visible={trk_rate:5.1f}%")
+                  f"tracked_visible={trk_rate:5.1f}%  "
+                  f"bridged(incl.Kalman)={bridged_rate:5.1f}%")
 
         if args.max_frames and n_total >= args.max_frames:
             break
@@ -198,6 +202,8 @@ def main() -> None:
           f"(>=1 candidate above conf={args.conf})")
     print(f"  tracked visible rate: {n_track_vis / max(n_total,1)*100:.1f}%  "
           f"(detected, excludes Kalman-predicted)")
+    print(f"  bridged rate        : {n_track_bridged / max(n_total,1)*100:.1f}%  "
+          f"(detected + Kalman-predicted = usable for framing)")
     print(f"  tracker             : {'OFF (--no-track)' if args.no_track else f'ON (max_disp={args.max_disp})'}")
     print(f"  output video        : {args.out}")
     print("\n── heatmap peak distribution (best tile per frame) ──")

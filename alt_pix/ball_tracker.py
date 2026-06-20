@@ -27,7 +27,12 @@ import numpy as np
 from .detector import Detection, _COCO_SPORTS_BALL
 from .trajectory import ParabolicSmoother
 
-MAX_MISS_FRAMES = 5  # frames to keep predicting without a detection
+MAX_MISS_FRAMES = 25  # frames to keep predicting without a detection.
+# A volleyball spike crosses the court in ~0.5–1s (12–25 frames @25fps) with
+# heavy motion blur that TrackNetV2 cannot follow. We bridge that gap with the
+# constant-velocity Kalman prediction. 25 frames is the practical ceiling: a
+# longer constant-velocity extrapolation diverges badly (the ball decelerates,
+# bounces, or is received), so beyond this we declare the ball lost.
 MAX_DISP = 300.0     # max ball displacement between frames (px); WASB default
 QUALITY_WEIGHT = 0.5  # weight of prediction-proximity vs. raw confidence
 
