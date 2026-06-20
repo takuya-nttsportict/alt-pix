@@ -76,10 +76,9 @@ def _postprocess(
     x2 = ((cx + bw / 2) - pad_x) / scale
     y2 = ((cy + bh / 2) - pad_y) / scale
 
-    boxes = np.stack([x1, y1, x2, y2], axis=1).astype(np.float32)
-    indices = cv2.dnn.NMSBoxes(
-        boxes.tolist(), scores.tolist(), conf_thr, iou_threshold=0.45
-    )
+    # cv2.dnn.NMSBoxes expects [x, y, w, h] format and positional nms_threshold
+    xywh = np.stack([x1, y1, x2 - x1, y2 - y1], axis=1).tolist()
+    indices = cv2.dnn.NMSBoxes(xywh, scores.tolist(), conf_thr, 0.45)
     if len(indices) == 0:
         return []
 
