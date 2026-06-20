@@ -72,6 +72,7 @@ def main() -> None:
     n_raw_hit = 0       # frames with >=1 raw candidate
     n_track_vis = 0     # frames the tracker reports the ball visible
     trail: deque[tuple[int, int]] = deque(maxlen=25)
+    peak_hist = np.zeros(11, dtype=int)  # peak distribution in 0.0..1.0 buckets
 
     # Mirror the detector's tile layout for heatmap visualisation
     tile_xs: list[int] | None = None
@@ -130,6 +131,9 @@ def main() -> None:
                     best_x0 = x0
 
         hm_canvas = np.zeros((h, w, 3), dtype=np.uint8)
+        # Track peak histogram
+        peak_hist[min(int(best_peak * 10), 10)] += 1
+
         if best_hm is not None:
             hm_u8 = (np.clip(best_hm, 0, 1) * 255).astype(np.uint8)
             hm_color = cv2.applyColorMap(cv2.resize(hm_u8, (tile_w, h)), cv2.COLORMAP_JET)
@@ -183,9 +187,17 @@ def main() -> None:
           f"(detected, excludes Kalman-predicted)")
     print(f"  tracker             : {'OFF (--no-track)' if args.no_track else f'ON (max_disp={args.max_disp})'}")
     print(f"  output video        : {args.out}")
+    print("\n── heatmap peak distribution (best tile per frame) ──")
+    buckets = [f"{i/10:.1f}-{(i+1)/10:.1f}" for i in range(11)]
+    buckets[-1] = "1.0"
+    for i, cnt in enumerate(peak_hist):
+        bar = "█" * min(cnt, 40)
+        print(f"  {buckets[i]:9s}: {cnt:4d} {bar}")
     print("\n  Inspect the video: green=detected ball, cyan=predicted (Kalman),")
     print("  yellow dots=raw candidates. A good track stays on the ball and the")
     print("  green marker should NOT jump to stray yellow dots when the ball is lost.")
+    print(f"\n  Tip: if peak distribution is mostly in 0.3-0.5 bucket,")
+    print(f"  try --conf 0.3 to increase detection rate (at cost of more false positives).")
 
 
 if __name__ == "__main__":

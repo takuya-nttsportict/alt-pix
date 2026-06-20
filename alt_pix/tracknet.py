@@ -335,11 +335,26 @@ class TrackNetDetector:
             logger.debug(f"TrackNet: best_peak={best_peak:.3f} < thr={self._conf_thr} → no ball")
             return []
 
+        # Deduplicate candidates from overlapping tiles: suppress any candidate
+        # whose center is within 2*r of a higher-confidence candidate.
+        candidates.sort(key=lambda d: d.conf, reverse=True)
+        kept: list[Detection] = []
+        for cand in candidates:
+            cx = (cand.bbox[0] + cand.bbox[2]) / 2
+            cy = (cand.bbox[1] + cand.bbox[3]) / 2
+            too_close = any(
+                abs(cx - (k.bbox[0] + k.bbox[2]) / 2) < 2 * r and
+                abs(cy - (k.bbox[1] + k.bbox[3]) / 2) < 2 * r
+                for k in kept
+            )
+            if not too_close:
+                kept.append(cand)
+
         logger.debug(
-            f"TrackNet: {len(candidates)} candidate(s)  best_peak={best_peak:.3f}  "
-            f"tiles={len(self._tile_xs)}"
+            f"TrackNet: {len(kept)} candidate(s) (raw={len(candidates)})  "
+            f"best_peak={best_peak:.3f}  tiles={len(self._tile_xs)}"
         )
-        return candidates
+        return kept
 
     def reset(self) -> None:
         """Clear all tile buffers (call after stream discontinuity)."""
