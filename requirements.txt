@@ -1,28 +1,36 @@
-# Stream ingestion
+# ── Stream ingestion ──────────────────────────────────────────────────────────
 av>=12.0.0
 
-# Detection: YOLOX (Apache 2.0, Megvii)
-# Install separately: pip install yolox
-# or: pip install git+https://github.com/Megvii-BaseDetection/YOLOX.git
-torch>=2.0.0
-torchvision>=0.15.0
-onnxruntime-gpu>=1.17.0
+# ── Detection (YOLOX, Apache 2.0) ─────────────────────────────────────────────
+# torch/torchvision are pre-installed in the base image (nvcr.io/nvidia/pytorch)
+# Listed here for documentation; pip will skip if already satisfied.
+torch>=2.3.0
+torchvision>=0.18.0
 
-# Tracking
-# StrongSORT (MIT): pip install git+https://github.com/dyhBUPT/StrongSORT.git
-# or use boxmot which bundles StrongSORT + ByteTrack + OSNet ReID
-boxmot>=10.0.0
+# ONNX runtime for YOLOX inference (GPU build)
+onnxruntime-gpu>=1.18.0
 
-# OCR
-paddlepaddle-gpu>=2.6.0
-paddleocr>=2.7.0
+# ── Tracking (Roboflow trackers: ByteTrack, SORT, OC-SORT, BoT-SORT) ─────────
+# trackers requires numpy>=2.0.2; supervision provides sv.Detections format
+trackers>=2.4.0
+supervision>=0.29.0
 
-# Video processing & visualization
-opencv-python-headless>=4.9.0
-numpy>=1.24.0
-scipy>=1.11.0
+# ── OCR ───────────────────────────────────────────────────────────────────────
+easyocr>=1.7.0
 
-# Utilities
+# ── Video / image processing ──────────────────────────────────────────────────
+# Use headless build to avoid pulling in GUI libs
+opencv-python-headless>=4.10.0
+
+# numpy 2.x required by boxmot and opencv 4.10+
+numpy>=2.0.0
+
+scipy>=1.13.0
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
 tqdm>=4.66.0
-pyyaml>=6.0
+pyyaml>=6.0.2
 loguru>=0.7.0
+
+# ── Dataset download (optional, only needed for fine-tuning) ──────────────────
+# roboflow>=1.1.0

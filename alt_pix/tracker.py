@@ -1,17 +1,16 @@
-"""Multi-object tracking via boxmot (StrongSORT / ByteTrack).
+"""Multi-object tracking via Roboflow trackers (Apache 2.0).
 
-boxmot (Apache 2.0) bundles StrongSORT, ByteTrack, OC-SORT, etc. with
-OSNet ReID models.  Install: pip install boxmot
+Uses `trackers.ByteTrackTracker` + `supervision.Detections` (numpy 2.x compatible).
 
-StrongSORT is preferred for volleyball because appearance features (ReID)
-maintain player IDs through brief occlusions (net, other players).
-ByteTrack is offered as a faster fallback.
+Input  : list[Detection] from detector.py + BGR frame
+Output : list[Track] with stable track IDs
+
+Install: pip install trackers supervision
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from pathlib import Path
+from dataclasses import dataclass
 from typing import Literal
 
 import numpy as np
@@ -25,70 +24,75 @@ class Track:
     bbox: tuple[float, float, float, float]  # x1, y1, x2, y2
     conf: float
     class_id: int
-    jersey_number: str | None = None  # filled in by OCR stage
+    jersey_number: str | None = None
 
 
-def _dets_to_boxmot_input(detections: list[Detection]) -> np.ndarray:
-    """Convert Detection list → (N, 6) float32 array [x1,y1,x2,y2,conf,cls]."""
+def _dets_to_sv(detections: list[Detection]):
+    """Convert Detection list → supervision.Detections."""
+    import supervision as sv
+
     if not detections:
-        return np.empty((0, 6), dtype=np.float32)
-    rows = [
-        [*d.bbox, d.conf, d.class_id] for d in detections
-    ]
-    return np.array(rows, dtype=np.float32)
+        return sv.Detections.empty()
+
+    xyxy = np.array([d.bbox for d in detections], dtype=np.float32)
+    confidence = np.array([d.conf for d in detections], dtype=np.float32)
+    class_id = np.array([d.class_id for d in detections], dtype=int)
+    return sv.Detections(xyxy=xyxy, confidence=confidence, class_id=class_id)
 
 
 class PlayerTracker:
-    """Wraps boxmot tracker for person tracking.
+    """Wraps ByteTrackTracker for person tracking.
 
     Args:
-        method: 'strongsort' (default) or 'bytetrack'.
-        reid_model: OSNet weights path or name ('osnet_x0_25', 'osnet_ain_x1_0').
-                    Only used by StrongSORT.
-        device: 'cuda:0' or 'cpu'.
+        method: Currently only 'bytetrack' is supported via the trackers package.
+                'strongsort' will be added when an appearance-based tracker
+                with numpy 2.x support becomes available.
+        track_activation_threshold: Min detection confidence to start a new track.
+        lost_track_buffer: Frames to keep a lost track alive (covers brief occlusions).
+        minimum_consecutive_frames: Frames required to confirm a new track.
+        fps: Source video / stream frame rate (used for time-scaling).
     """
 
     def __init__(
         self,
-        method: Literal["strongsort", "bytetrack"] = "strongsort",
-        reid_model: str = "osnet_x0_25",
-        device: str = "cuda:0",
+        method: Literal["bytetrack"] = "bytetrack",
+        track_activation_threshold: float = 0.5,
+        lost_track_buffer: int = 30,
+        minimum_consecutive_frames: int = 2,
+        fps: float = 30.0,
     ) -> None:
-        try:
-            from boxmot import StrongSORT, ByteTrack
-        except ImportError as e:
-            raise ImportError(
-                "Install boxmot: pip install boxmot"
-            ) from e
+        from trackers import ByteTrackTracker
 
-        if method == "strongsort":
-            self._tracker = StrongSORT(
-                model_weights=Path(reid_model),
-                device=device,
-                fp16=True,
-            )
-        else:
-            self._tracker = ByteTrack(
-                device=device,
-                fp16=True,
-            )
+        self._tracker = ByteTrackTracker(
+            track_activation_threshold=track_activation_threshold,
+            lost_track_buffer=lost_track_buffer,
+            minimum_consecutive_frames=minimum_consecutive_frames,
+            frame_rate=fps,
+        )
 
     def update(self, detections: list[Detection], frame: np.ndarray) -> list[Track]:
-        """Update tracker with new detections; return active tracks."""
-        dets = _dets_to_boxmot_input(
-            [d for d in detections if d.class_id == _COCO_PERSON]
-        )
-        # boxmot returns (N, 7): x1, y1, x2, y2, track_id, conf, cls
-        raw = self._tracker.update(dets, frame)
+        """Update tracker with new detections; return confirmed active tracks.
+
+        tracker_id == -1 means the track is not yet confirmed
+        (fewer than minimum_consecutive_frames seen); those are filtered out.
+        """
+        person_dets = [d for d in detections if d.class_id == _COCO_PERSON]
+        sv_dets = _dets_to_sv(person_dets)
+
+        tracked = self._tracker.update(sv_dets)
+
         tracks = []
-        for row in raw:
-            x1, y1, x2, y2, tid, conf, cls = row[:7]
-            tracks.append(
-                Track(
-                    track_id=int(tid),
-                    bbox=(float(x1), float(y1), float(x2), float(y2)),
-                    conf=float(conf),
-                    class_id=int(cls),
-                )
-            )
+        for i in range(len(tracked)):
+            tid = int(tracked.tracker_id[i]) if tracked.tracker_id is not None else -1
+            if tid < 0:
+                continue  # unconfirmed track
+            x1, y1, x2, y2 = tracked.xyxy[i]
+            conf = float(tracked.confidence[i]) if tracked.confidence is not None else 0.0
+            cls = int(tracked.class_id[i]) if tracked.class_id is not None else _COCO_PERSON
+            tracks.append(Track(
+                track_id=tid,
+                bbox=(float(x1), float(y1), float(x2), float(y2)),
+                conf=conf,
+                class_id=cls,
+            ))
         return tracks
