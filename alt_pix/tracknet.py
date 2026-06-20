@@ -144,25 +144,32 @@ class _Down3(nn.Module):
 
 
 class _Up2(nn.Module):
-    """Upsample + cat skip + DoubleConv."""
+    """Upsample + cat skip + DoubleConv.
+
+    Concatenation order matches WASB Up.forward: torch.cat([skip, upsampled]).
+    The trained weights expect skip channels first.
+    """
     def __init__(self, in_ch: int, skip_ch: int, out_ch: int) -> None:
         super().__init__()
         self.up = nn.Upsample(scale_factor=2, mode="nearest")
-        self.conv = _DoubleConv(in_ch + skip_ch, out_ch)
+        self.conv = _DoubleConv(skip_ch + in_ch, out_ch)
 
     def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
-        return self.conv(torch.cat([self.up(x), skip], dim=1))
+        return self.conv(torch.cat([skip, self.up(x)], dim=1))
 
 
 class _Up3(nn.Module):
-    """Upsample + cat skip + TripleConv."""
+    """Upsample + cat skip + TripleConv.
+
+    Concatenation order matches WASB Up.forward: torch.cat([skip, upsampled]).
+    """
     def __init__(self, in_ch: int, skip_ch: int, out_ch: int) -> None:
         super().__init__()
         self.up = nn.Upsample(scale_factor=2, mode="nearest")
-        self.conv = _TripleConv(in_ch + skip_ch, out_ch)
+        self.conv = _TripleConv(skip_ch + in_ch, out_ch)
 
     def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
-        return self.conv(torch.cat([self.up(x), skip], dim=1))
+        return self.conv(torch.cat([skip, self.up(x)], dim=1))
 
 
 class _OutConv(nn.Module):
