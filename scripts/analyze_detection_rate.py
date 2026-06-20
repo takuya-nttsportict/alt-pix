@@ -118,17 +118,64 @@ def main() -> None:
         bar = "█" * min(cnt, 40)
         print(f"  {lo:.1f}-{hi:.1f}: {cnt:4d}  {bar}")
 
-    # Recommendation
-    target_rate = 40.0  # want at least 40% detection
-    best_thr = None
-    for thr in thresholds:
-        if (peaks_arr > thr).mean() * 100 >= target_rate:
-            best_thr = thr
-    if best_thr is not None:
-        print(f"\n  Recommended --conf {best_thr} for ≥{target_rate:.0f}% detection rate")
+    # ── Bimodality check ──────────────────────────────────────────────────────
+    # If detections are confident-or-nothing, the right threshold is the valley
+    # between the two modes, NOT whatever hits an arbitrary target rate.
+    low_mass = int((peaks_arr < 0.2).sum())     # "blind" mode
+    high_mass = int((peaks_arr > 0.6).sum())    # "confident" mode
+    mid_mass = len(peaks_arr) - low_mass - high_mass
+    bimodal = mid_mass < 0.5 * min(low_mass, high_mass)
+    print(f"\n  Mode masses: blind(<0.2)={low_mass}  mid(0.2-0.6)={mid_mass}  "
+          f"confident(>0.6)={high_mass}")
+
+    if bimodal:
+        print("  → BIMODAL: model is confident-or-blind. Keep --conf in the valley")
+        print("    (~0.5). Lowering it only adds low-confidence false positives.")
+        print("    The real lever is the blind frames, not the threshold.")
     else:
-        print(f"\n  WARNING: can't reach {target_rate:.0f}% detection even at conf=0.1")
-        print("  The model may not be well-suited for this footage.")
+        target_rate = 40.0
+        best_thr = None
+        for thr in thresholds:
+            if (peaks_arr > thr).mean() * 100 >= target_rate:
+                best_thr = thr
+        if best_thr is not None:
+            print(f"  Recommended --conf {best_thr} for ≥{target_rate:.0f}% detection rate")
+        else:
+            print(f"  WARNING: can't reach {target_rate:.0f}% detection even at conf=0.1")
+
+    # ── Gap-length analysis at conf=0.5 (can the Kalman bridge the misses?) ────
+    thr = 0.5
+    detected = peaks_arr > thr
+    gaps: list[int] = []
+    run = 0
+    for d in detected:
+        if not d:
+            run += 1
+        elif run > 0:
+            gaps.append(run)
+            run = 0
+    if run > 0:
+        gaps.append(run)
+
+    print(f"\n── Miss-gap analysis at conf={thr} ──")
+    if gaps:
+        gaps_arr = np.array(gaps)
+        bridgeable = int((gaps_arr <= 5).sum())   # MAX_MISS_FRAMES = 5
+        print(f"  {len(gaps)} gaps  total_missed={int(gaps_arr.sum())}  "
+              f"longest={gaps_arr.max()}  median={int(np.median(gaps_arr))}")
+        print(f"  gaps ≤5 frames (Kalman-bridgeable): {bridgeable}/{len(gaps)} "
+              f"({100*bridgeable/len(gaps):.0f}%)")
+        gh, ge = np.histogram(gaps_arr, bins=[1, 2, 4, 6, 11, 21, 10**6])
+        labels = ["1", "2-3", "4-5", "6-10", "11-20", "21+"]
+        for lab, cnt in zip(labels, gh):
+            bar = "█" * min(int(cnt), 40)
+            print(f"  gap {lab:6s}: {cnt:4d}  {bar}")
+        print("\n  Interpretation:")
+        print("  - Many short gaps (≤5) → Kalman interpolation fills them → good.")
+        print("  - Few long gaps (>10) → ball genuinely out of play (timeout, dead")
+        print("    ball) OR model failure; check the video for those stretches.")
+    else:
+        print("  No gaps — ball detected every frame.")
 
 
 if __name__ == "__main__":
