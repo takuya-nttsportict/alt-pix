@@ -202,6 +202,33 @@ def _preprocess_tile(frame_bgr: np.ndarray, x0: int, tile_w: int) -> torch.Tenso
     return torch.from_numpy(t).permute(2, 0, 1).contiguous()
 
 
+def _detect_blobs(hm: np.ndarray, score_thr: float) -> list[tuple[float, float, float]]:
+    """Connected-component blob detection on a sigmoid heatmap (WASB concomp).
+
+    Mirrors TracknetV2Postprocessor._detect_blob_concomp with use_hm_weight=True:
+    threshold the heatmap, label connected components, and for each component
+    return the heatmap-weighted centroid plus the peak value within the blob.
+
+    Returns a list of (x, y, peak) in heatmap pixel coordinates.
+    """
+    if hm.max() <= score_thr:
+        return []
+    _, hm_th = cv2.threshold(hm, score_thr, 1, cv2.THRESH_BINARY)
+    n_labels, labels = cv2.connectedComponents(hm_th.astype(np.uint8))
+    blobs: list[tuple[float, float, float]] = []
+    for m in range(1, n_labels):
+        ys, xs = np.where(labels == m)
+        ws = hm[ys, xs]
+        wsum = float(ws.sum())
+        if wsum <= 0:
+            continue
+        x = float(np.sum(xs * ws) / wsum)
+        y = float(np.sum(ys * ws) / wsum)
+        peak = float(ws.max())
+        blobs.append((x, y, peak))
+    return blobs
+
+
 # ── Inference wrapper ─────────────────────────────────────────────────────────
 
 class TrackNetDetector:
@@ -263,7 +290,14 @@ class TrackNetDetector:
     # ── public ────────────────────────────────────────────────────────────────
 
     def detect(self, frame: np.ndarray) -> list[Detection]:
-        """Return at most 1 Detection (the ball), or [] if below threshold."""
+        """Return ALL ball candidates (one per heatmap blob across all tiles).
+
+        Multiple candidates are returned so a downstream motion-aware tracker
+        (BallTracker, WASB OnlineTracker style) can choose the one consistent
+        with the ball's trajectory.  Each Detection.conf is the blob's peak
+        sigmoid value.  Returns [] during the 3-frame warm-up or when no blob
+        exceeds conf_thr.
+        """
         h, w = frame.shape[:2]
         self._ensure_tiles(h, w)
 
@@ -274,8 +308,9 @@ class TrackNetDetector:
         if len(self._bufs[0]) < 3:
             return []   # buffer warming up
 
+        r = max(min(w, h) * 0.02, 4.0)
+        candidates: list[Detection] = []
         best_peak = 0.0
-        best_det: Detection | None = None
 
         for i, x0 in enumerate(self._tile_xs):
             stacked = torch.cat(list(self._bufs[i]), dim=0).unsqueeze(0).to(self._device)
@@ -283,34 +318,28 @@ class TrackNetDetector:
                 logits  = self._model(stacked)[0]         # (1, 3, H, W)
                 heatmap = torch.sigmoid(logits[0, 2])     # (H, W)
 
-            hm   = heatmap.cpu().numpy()
-            peak = float(hm.max())
+            hm = heatmap.cpu().numpy()
+            best_peak = max(best_peak, float(hm.max()))
 
-            if peak > best_peak:
-                best_peak = peak
-                if peak >= self._conf_thr:
-                    ym, xm = np.unravel_index(hm.argmax(), hm.shape)
-                    # Map heatmap coords → full-frame coords
-                    cx = x0 + float(xm) * self._tile_w / _W
-                    cy = float(ym) * h / _H
-                    r  = max(min(w, h) * 0.02, 4.0)
-                    best_det = Detection(
-                        bbox=(cx - r, cy - r, cx + r, cy + r),
-                        conf=peak,
-                        class_id=_COCO_SPORTS_BALL,
-                    )
+            for bx, by, peak in _detect_blobs(hm, self._conf_thr):
+                # Map heatmap coords → full-frame coords
+                cx = x0 + bx * self._tile_w / _W
+                cy = by * h / _H
+                candidates.append(Detection(
+                    bbox=(cx - r, cy - r, cx + r, cy + r),
+                    conf=peak,
+                    class_id=_COCO_SPORTS_BALL,
+                ))
 
-        if best_det is None:
+        if not candidates:
             logger.debug(f"TrackNet: best_peak={best_peak:.3f} < thr={self._conf_thr} → no ball")
             return []
 
-        cx = (best_det.bbox[0] + best_det.bbox[2]) / 2
-        cy = (best_det.bbox[1] + best_det.bbox[3]) / 2
         logger.debug(
-            f"TrackNet: ball=({cx:.1f},{cy:.1f})  peak={best_peak:.3f}  "
+            f"TrackNet: {len(candidates)} candidate(s)  best_peak={best_peak:.3f}  "
             f"tiles={len(self._tile_xs)}"
         )
-        return [best_det]
+        return candidates
 
     def reset(self) -> None:
         """Clear all tile buffers (call after stream discontinuity)."""
