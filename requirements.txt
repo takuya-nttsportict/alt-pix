@@ -32,5 +32,6 @@ tqdm>=4.66.0
 pyyaml>=6.0.2
 loguru>=0.7.0
 
-# ── Dataset download (optional, only needed for fine-tuning) ──────────────────
-# roboflow>=1.1.0
+# ── Model / dataset download ──────────────────────────────────────────────────
+gdown>=5.1.0          # Google Drive download for TrackNet pretrained weights
+# roboflow>=1.1.0     # (optional, only for ball dataset fine-tuning)
