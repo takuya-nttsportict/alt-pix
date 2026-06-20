@@ -4,21 +4,32 @@ Exact architecture from nttcom/WASB-SBDT (MIT licence, BMVC 2023):
   src/models/unet2d.py + src/models/unet2d_parts.py
 
 State-dict key mapping verified against volleyball checkpoint:
-  inc.double_conv.{0,2,3,5}.*        DoubleConv: Conv→ReLU→BN→Conv→ReLU→BN
-  down1.maxpool_conv.1.double_conv.*  Down2: MaxPool + DoubleConv
-  down2/3.maxpool_conv.1.triple_conv.{0,2,3,5,6,8}.*  Down3: MaxPool + TripleConv
+  inc.double_conv.{0,2,3,5}.*       DoubleConv: Conv→ReLU→BN→Conv→ReLU→BN
+  down{1}.maxpool_conv.1.double_conv.*  Down2
+  down{2,3}.maxpool_conv.1.triple_conv.*  Down3
   up1.conv.triple_conv.*  Up3
-  up2/3.conv.double_conv.*  Up2
+  up{2,3}.conv.double_conv.*  Up2
   outc.conv.*
 
-Input : (B, 9, H, W)  — 3 consecutive BGR frames, each normalised to [0,1]
-Output: (B, 3, H, W)  — raw logits, one heatmap per input frame
-        sigmoid applied in post-processing; channel 2 = most recent frame.
+Input : (B, 9, H, W)  — 3 consecutive frames, ImageNet-normalised RGB tiles
+Output: (B, 3, H, W)  — raw logits per frame; channel 2 = most recent frame.
+
+Preprocessing (verified via scan_tracknet.py on 3840x800 volleyball footage):
+  BGR → RGB → crop 16:9 tile at native height → resize to 512x288 →
+  ÷255 → ImageNet mean/std normalise.
+
+Tiling rationale:
+  The source footage is 3840x800 (aspect 4.8).  Shrinking the whole frame to
+  512x288 would compress a 12px ball to ~1.6px, making the model blind.
+  Instead we split the frame into overlapping 16:9 tiles (height=frame_height,
+  width=frame_height*512/288) and run TrackNet on each tile independently.
+  The tile with the highest sigmoid peak wins.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 from collections import deque
 from pathlib import Path
 
@@ -37,51 +48,7 @@ _H = 288
 # WASB-SBDT preprocessing: ToTensor (÷255) → Normalize(ImageNet mean/std) on RGB.
 # Verified against src/dataloaders/__init__.py build_img_transforms().
 _MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-
-
-# ── Affine warp helpers (faithful copy of WASB src/utils/image.py) ───────────
-# WASB maps a centred square region (side = max(h, w)) of the source frame into
-# the (W, H) input via an affine transform, then maps heatmap peaks back with
-# the inverse.  We replicate exactly so coordinates match the training domain.
-
-def _get_dir(src_point: list[float], rot_rad: float) -> list[float]:
-    sn, cs = np.sin(rot_rad), np.cos(rot_rad)
-    return [src_point[0] * cs - src_point[1] * sn,
-            src_point[0] * sn + src_point[1] * cs]
-
-
-def _get_3rd_point(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    direct = a - b
-    return b + np.array([-direct[1], direct[0]], dtype=np.float32)
-
-
-def _get_affine_transform(center, scale, output_size, inv: int = 0) -> np.ndarray:
-    scale = np.array([scale, scale], dtype=np.float32)
-    src_w = scale[0]
-    dst_w, dst_h = output_size
-
-    src_dir = _get_dir([0, src_w * -0.5], 0.0)
-    dst_dir = np.array([0, dst_w * -0.5], np.float32)
-
-    src = np.zeros((3, 2), dtype=np.float32)
-    dst = np.zeros((3, 2), dtype=np.float32)
-    src[0, :] = center
-    src[1, :] = center + src_dir
-    dst[0, :] = [dst_w * 0.5, dst_h * 0.5]
-    dst[1, :] = np.array([dst_w * 0.5, dst_h * 0.5], np.float32) + dst_dir
-    src[2:, :] = _get_3rd_point(src[0, :], src[1, :])
-    dst[2:, :] = _get_3rd_point(dst[0, :], dst[1, :])
-
-    if inv:
-        return cv2.getAffineTransform(np.float32(dst), np.float32(src))
-    return cv2.getAffineTransform(np.float32(src), np.float32(dst))
-
-
-def _affine_point(pt: tuple[float, float], t: np.ndarray) -> tuple[float, float]:
-    v = np.array([pt[0], pt[1], 1.0], dtype=np.float32)
-    out = t @ v
-    return float(out[0]), float(out[1])
+_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 
 # ── Building blocks ───────────────────────────────────────────────────────────
@@ -91,12 +58,12 @@ class _DoubleConv(nn.Module):
     def __init__(self, in_ch: int, out_ch: int) -> None:
         super().__init__()
         self.double_conv = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=True),  # [0]
-            nn.ReLU(inplace=True),                               # [1]
-            nn.BatchNorm2d(out_ch),                              # [2]
-            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=True), # [3]
-            nn.ReLU(inplace=True),                               # [4]
-            nn.BatchNorm2d(out_ch),                              # [5]
+            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=True),   # [0]
+            nn.ReLU(inplace=True),                                # [1]
+            nn.BatchNorm2d(out_ch),                               # [2]
+            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=True),  # [3]
+            nn.ReLU(inplace=True),                                # [4]
+            nn.BatchNorm2d(out_ch),                               # [5]
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -108,15 +75,15 @@ class _TripleConv(nn.Module):
     def __init__(self, in_ch: int, out_ch: int) -> None:
         super().__init__()
         self.triple_conv = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=True),  # [0]
-            nn.ReLU(inplace=True),                               # [1]
-            nn.BatchNorm2d(out_ch),                              # [2]
-            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=True), # [3]
-            nn.ReLU(inplace=True),                               # [4]
-            nn.BatchNorm2d(out_ch),                              # [5]
-            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=True), # [6]
-            nn.ReLU(inplace=True),                               # [7]
-            nn.BatchNorm2d(out_ch),                              # [8]
+            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=True),   # [0]
+            nn.ReLU(inplace=True),                                # [1]
+            nn.BatchNorm2d(out_ch),                               # [2]
+            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=True),  # [3]
+            nn.ReLU(inplace=True),                                # [4]
+            nn.BatchNorm2d(out_ch),                               # [5]
+            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=True),  # [6]
+            nn.ReLU(inplace=True),                                # [7]
+            nn.BatchNorm2d(out_ch),                               # [8]
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -124,7 +91,6 @@ class _TripleConv(nn.Module):
 
 
 class _Down2(nn.Module):
-    """MaxPool + DoubleConv. Attr name must be maxpool_conv."""
     def __init__(self, in_ch: int, out_ch: int) -> None:
         super().__init__()
         self.maxpool_conv = nn.Sequential(nn.MaxPool2d(2), _DoubleConv(in_ch, out_ch))
@@ -134,7 +100,6 @@ class _Down2(nn.Module):
 
 
 class _Down3(nn.Module):
-    """MaxPool + TripleConv. Attr name must be maxpool_conv."""
     def __init__(self, in_ch: int, out_ch: int) -> None:
         super().__init__()
         self.maxpool_conv = nn.Sequential(nn.MaxPool2d(2), _TripleConv(in_ch, out_ch))
@@ -144,14 +109,10 @@ class _Down3(nn.Module):
 
 
 class _Up2(nn.Module):
-    """Upsample + cat skip + DoubleConv.
-
-    Concatenation order matches WASB Up.forward: torch.cat([skip, upsampled]).
-    The trained weights expect skip channels first.
-    """
+    """Upsample + cat([skip, up(x)]) + DoubleConv. Skip channels first (WASB order)."""
     def __init__(self, in_ch: int, skip_ch: int, out_ch: int) -> None:
         super().__init__()
-        self.up = nn.Upsample(scale_factor=2, mode="nearest")
+        self.up   = nn.Upsample(scale_factor=2, mode="nearest")
         self.conv = _DoubleConv(skip_ch + in_ch, out_ch)
 
     def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
@@ -159,13 +120,10 @@ class _Up2(nn.Module):
 
 
 class _Up3(nn.Module):
-    """Upsample + cat skip + TripleConv.
-
-    Concatenation order matches WASB Up.forward: torch.cat([skip, upsampled]).
-    """
+    """Upsample + cat([skip, up(x)]) + TripleConv. Skip channels first (WASB order)."""
     def __init__(self, in_ch: int, skip_ch: int, out_ch: int) -> None:
         super().__init__()
-        self.up = nn.Upsample(scale_factor=2, mode="nearest")
+        self.up   = nn.Upsample(scale_factor=2, mode="nearest")
         self.conv = _TripleConv(skip_ch + in_ch, out_ch)
 
     def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
@@ -173,7 +131,6 @@ class _Up3(nn.Module):
 
 
 class _OutConv(nn.Module):
-    """1×1 conv. Attr name must be conv."""
     def __init__(self, in_ch: int, out_ch: int) -> None:
         super().__init__()
         self.conv = nn.Conv2d(in_ch, out_ch, 1)
@@ -212,36 +169,79 @@ class TrackNetV2(nn.Module):
         return {0: self.outc(x)}
 
 
+# ── Tiling helpers ────────────────────────────────────────────────────────────
+
+def _compute_tiles(frame_w: int, frame_h: int, tile_overlap: float = 0.3) -> list[int]:
+    """Return list of tile x-offsets for overlapping 16:9 tiles at frame height.
+
+    Each tile is (tile_w × frame_h) where tile_w = frame_h × (512/288).
+    For standard 16:9 footage a single tile covers the whole frame.
+    """
+    tile_w = min(int(math.ceil(frame_h * _W / _H)), frame_w)
+    if tile_w >= frame_w:
+        return [0]
+    step = int(math.ceil(tile_w * (1.0 - tile_overlap)))
+    xs: list[int] = []
+    x = 0
+    while x + tile_w <= frame_w:
+        xs.append(x)
+        x += step
+    # Always include a tile ending at the right edge
+    if not xs or xs[-1] + tile_w < frame_w:
+        xs.append(frame_w - tile_w)
+    return xs
+
+
+def _preprocess_tile(frame_bgr: np.ndarray, x0: int, tile_w: int) -> torch.Tensor:
+    """Crop a tile, resize to 512×288, normalise. Returns (3, H, W) float32."""
+    crop = frame_bgr[:, x0: x0 + tile_w]               # (h, tile_w, 3) BGR
+    rgb  = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+    rs   = cv2.resize(rgb, (_W, _H), interpolation=cv2.INTER_LINEAR)
+    t    = rs.astype(np.float32) / 255.0
+    t    = (t - _MEAN) / _STD
+    return torch.from_numpy(t).permute(2, 0, 1).contiguous()
+
+
 # ── Inference wrapper ─────────────────────────────────────────────────────────
 
 class TrackNetDetector:
-    """Frame-by-frame ball detector using TrackNetV2 (WASB-SBDT).
+    """Frame-by-frame ball detector using TrackNetV2 (WASB-SBDT) with tiling.
 
-    Call detect(frame) once per frame.  Maintains an internal 3-frame buffer;
-    returns [] for the first 2 frames while the buffer fills.
+    For ultrawide panoramic footage (e.g. 3840×800) the full frame cannot be
+    naively resized to 512×288 because a 12px ball shrinks to <2px and
+    disappears.  Instead the frame is split into overlapping 16:9 tiles at
+    native height; TrackNet runs on each tile and the highest-confidence
+    result is returned.
+
+    For standard 16:9 footage a single tile covers the whole frame, so there
+    is no overhead.
+
+    Call detect(frame) once per frame.  Returns [] for the first 2 frames
+    while the 3-frame buffer warms up.
 
     Args:
-        model_path : Path to .pt checkpoint (state dict or model_state_dict wrapper).
-        input_size : (width, height) for inference — must be divisible by 8.
-        conf_thr   : Minimum sigmoid heatmap peak to report a detection.
+        model_path : Path to .pt checkpoint.
+        conf_thr   : Minimum sigmoid peak to report a detection (default 0.5).
+        tile_overlap: Fractional overlap between adjacent tiles (default 0.3).
         device     : 'cuda' or 'cpu'.
     """
 
     def __init__(
         self,
         model_path: str | Path,
-        input_size: tuple[int, int] = (_W, _H),
         conf_thr: float = 0.5,
+        tile_overlap: float = 0.3,
         device: str = "cuda",
     ) -> None:
-        self._w, self._h = input_size
-        self._conf_thr = conf_thr
+        self._conf_thr    = conf_thr
+        self._tile_overlap = tile_overlap
         self._device = torch.device(device if torch.cuda.is_available() else "cpu")
 
         self._model = TrackNetV2(n_channels=9, n_classes=3)
         ckpt = torch.load(str(model_path), map_location=self._device, weights_only=False)
         if isinstance(ckpt, dict):
-            state = ckpt.get("model_state_dict", ckpt.get("model", ckpt.get("state_dict", ckpt)))
+            state = ckpt.get("model_state_dict",
+                             ckpt.get("model", ckpt.get("state_dict", ckpt)))
         else:
             state = ckpt
         state = {(k[len("module."):] if k.startswith("module.") else k): v
@@ -249,86 +249,85 @@ class TrackNetDetector:
         self._model.load_state_dict(state, strict=True)
         self._model.eval().to(self._device)
 
-        self._buf: deque[torch.Tensor] = deque(maxlen=3)
-
-        # Affine transforms are derived lazily once the first frame size is known.
-        self._trans: np.ndarray | None = None       # original → (W, H)
-        self._trans_inv: np.ndarray | None = None    # (W, H) → original
-        self._src_hw: tuple[int, int] | None = None
+        # Tile layout and per-tile 3-frame buffers — initialised on first frame.
+        self._tile_xs:  list[int] | None = None   # x-offsets of tiles
+        self._tile_w:   int | None = None          # tile width in pixels
+        self._frame_hw: tuple[int, int] | None = None
+        self._bufs:     list[deque[torch.Tensor]] = []
 
         logger.info(
-            f"TrackNetV2 loaded: {model_path}  "
-            f"device={self._device}  input={self._w}×{self._h}  conf_thr={conf_thr}"
+            f"TrackNetV2 loaded: {model_path}  device={self._device}  "
+            f"conf_thr={conf_thr}  tile_overlap={tile_overlap}"
         )
 
-    def detect(self, frame: np.ndarray) -> list[Detection]:
-        """Return a list of at most 1 Detection (the ball) or [] if not found."""
-        h_orig, w_orig = frame.shape[:2]
-        self._ensure_transforms(h_orig, w_orig)
-        self._buf.append(self._preprocess(frame))
+    # ── public ────────────────────────────────────────────────────────────────
 
-        if len(self._buf) < 3:
+    def detect(self, frame: np.ndarray) -> list[Detection]:
+        """Return at most 1 Detection (the ball), or [] if below threshold."""
+        h, w = frame.shape[:2]
+        self._ensure_tiles(h, w)
+
+        # Append new preprocessed tile crops to each buffer
+        for i, x0 in enumerate(self._tile_xs):
+            self._bufs[i].append(_preprocess_tile(frame, x0, self._tile_w))
+
+        if len(self._bufs[0]) < 3:
+            return []   # buffer warming up
+
+        best_peak = 0.0
+        best_det: Detection | None = None
+
+        for i, x0 in enumerate(self._tile_xs):
+            stacked = torch.cat(list(self._bufs[i]), dim=0).unsqueeze(0).to(self._device)
+            with torch.no_grad():
+                logits  = self._model(stacked)[0]         # (1, 3, H, W)
+                heatmap = torch.sigmoid(logits[0, 2])     # (H, W)
+
+            hm   = heatmap.cpu().numpy()
+            peak = float(hm.max())
+
+            if peak > best_peak:
+                best_peak = peak
+                if peak >= self._conf_thr:
+                    ym, xm = np.unravel_index(hm.argmax(), hm.shape)
+                    # Map heatmap coords → full-frame coords
+                    cx = x0 + float(xm) * self._tile_w / _W
+                    cy = float(ym) * h / _H
+                    r  = max(min(w, h) * 0.02, 4.0)
+                    best_det = Detection(
+                        bbox=(cx - r, cy - r, cx + r, cy + r),
+                        conf=peak,
+                        class_id=_COCO_SPORTS_BALL,
+                    )
+
+        if best_det is None:
+            logger.debug(f"TrackNet: best_peak={best_peak:.3f} < thr={self._conf_thr} → no ball")
             return []
 
-        stacked = torch.cat(list(self._buf), dim=0).unsqueeze(0).to(self._device)  # (1, 9, H, W)
-
-        with torch.no_grad():
-            logits = self._model(stacked)[0]          # (1, 3, H, W)
-            heatmap = torch.sigmoid(logits[0, 2])     # (H, W) — most recent frame
-
-        return self._postprocess(heatmap)
+        cx = (best_det.bbox[0] + best_det.bbox[2]) / 2
+        cy = (best_det.bbox[1] + best_det.bbox[3]) / 2
+        logger.debug(
+            f"TrackNet: ball=({cx:.1f},{cy:.1f})  peak={best_peak:.3f}  "
+            f"tiles={len(self._tile_xs)}"
+        )
+        return [best_det]
 
     def reset(self) -> None:
-        """Clear the frame buffer (call after stream discontinuity)."""
-        self._buf.clear()
+        """Clear all tile buffers (call after stream discontinuity)."""
+        for buf in self._bufs:
+            buf.clear()
 
     # ── private ───────────────────────────────────────────────────────────────
 
-    def _ensure_transforms(self, h: int, w: int) -> None:
-        """Build the affine warp + inverse for the current frame size (WASB).
-
-        WASB uses center=(w/2,h/2), scale=max(h,w); it maps a centred square
-        region into (W, H).  Cached until the frame size changes.
-        """
-        if self._src_hw == (h, w):
+    def _ensure_tiles(self, h: int, w: int) -> None:
+        """Compute tile layout on first call or if frame size changes."""
+        if self._frame_hw == (h, w):
             return
-        center = np.array([w / 2.0, h / 2.0], dtype=np.float32)
-        scale = float(max(h, w))
-        self._trans = _get_affine_transform(center, scale, (self._w, self._h), inv=0)
-        self._trans_inv = _get_affine_transform(center, scale, (self._w, self._h), inv=1)
-        self._src_hw = (h, w)
-        logger.debug(f"TrackNet: affine transform built for frame {w}×{h}")
-
-    def _preprocess(self, frame: np.ndarray) -> torch.Tensor:
-        """BGR→RGB, affine warp to (W, H), ÷255, ImageNet normalise. Returns (3, H, W)."""
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        warped = cv2.warpAffine(rgb, self._trans, (self._w, self._h),
-                                flags=cv2.INTER_LINEAR)            # (H, W, 3) uint8 RGB
-        t = warped.astype(np.float32) / 255.0
-        t = (t - _MEAN) / _STD                                     # ImageNet normalise
-        return torch.from_numpy(t).permute(2, 0, 1).contiguous()   # (3, H, W)
-
-    def _postprocess(self, heatmap: torch.Tensor) -> list[Detection]:
-        hm = heatmap.cpu().numpy()
-        peak = float(hm.max())
-
-        if peak < self._conf_thr:
-            logger.debug(f"TrackNet: peak={peak:.3f} < thr={self._conf_thr} → no ball")
-            return []
-
-        ym, xm = np.unravel_index(hm.argmax(), hm.shape)
-
-        # Map peak from (W, H) heatmap space back to original frame via inverse affine.
-        cx, cy = _affine_point((float(xm), float(ym)), self._trans_inv)
-
-        w_orig = self._src_hw[1]
-        h_orig = self._src_hw[0]
-        r = max(min(w_orig, h_orig) * 0.02, 4.0)
-
-        logger.debug(f"TrackNet: ball=({cx:.1f},{cy:.1f})  peak={peak:.3f}  r={r:.1f}")
-
-        return [Detection(
-            bbox=(cx - r, cy - r, cx + r, cy + r),
-            conf=peak,
-            class_id=_COCO_SPORTS_BALL,
-        )]
+        self._tile_xs = _compute_tiles(w, h, self._tile_overlap)
+        self._tile_w  = min(int(math.ceil(h * _W / _H)), w)
+        self._bufs    = [deque(maxlen=3) for _ in self._tile_xs]
+        self._frame_hw = (h, w)
+        logger.info(
+            f"TrackNet: frame={w}×{h}  tile_w={self._tile_w}  "
+            f"n_tiles={len(self._tile_xs)}  xs={self._tile_xs}"
+        )

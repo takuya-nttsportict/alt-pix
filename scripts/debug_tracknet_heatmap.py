@@ -1,26 +1,22 @@
 #!/usr/bin/env python3
 """
-Debug / evaluate the TrackNet ball detector by visualising its raw heatmap.
+Debug / evaluate the TrackNet ball detector by visualising its heatmaps.
 
-For each frame it writes a side-by-side video:
-    [ left ] original frame with the detected peak marked
-    [ right ] sigmoid heatmap (channel 2 = current frame), JET-coloured
-
-It also prints per-interval peak statistics so you can judge whether the
-model is firing at all and pick a sensible --conf threshold.
+For each frame it shows the tile with the best peak and writes a side-by-side
+video: [ left ] original frame with detection marked, [ right ] heatmap JET.
+Also prints per-interval peak statistics.
 
 Usage:
   python scripts/debug_tracknet_heatmap.py \\
-    --source game.mp4 \\
-    --model  models/tracknet_volleyball.pt \\
-    --out    heatmap_debug.mp4 \\
-    --max-frames 600
+    --source videos/volley-2.mp4 --model models/tracknet_volleyball.pt \\
+    --out videos/heatmap_debug.mp4 --max-frames 600
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
+from collections import deque
 from pathlib import Path
 
 import cv2
@@ -31,7 +27,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from alt_pix.log_config import setup_logging
 from alt_pix.stream import iter_frames
-from alt_pix.tracknet import TrackNetDetector
+from alt_pix.tracknet import (
+    TrackNetDetector, TrackNetV2,
+    _MEAN, _STD, _W, _H,
+    _preprocess_tile, _compute_tiles,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -40,6 +40,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model", default="models/tracknet_volleyball.pt")
     p.add_argument("--out", default="heatmap_debug.mp4")
     p.add_argument("--conf", type=float, default=0.5)
+    p.add_argument("--tile-overlap", type=float, default=0.3)
     p.add_argument("--device", default="cuda")
     p.add_argument("--max-frames", type=int, default=600)
     p.add_argument("--log-level", default="INFO",
@@ -51,49 +52,84 @@ def main() -> None:
     args = parse_args()
     setup_logging(level=args.log_level)
 
-    det = TrackNetDetector(args.model, conf_thr=args.conf, device=args.device)
+    det = TrackNetDetector(args.model, conf_thr=args.conf,
+                           tile_overlap=args.tile_overlap, device=args.device)
 
-    # Monkey-tap the model output: re-run detect() but also keep the raw heatmap.
     writer: cv2.VideoWriter | None = None
     peaks: list[float] = []
     n_hit = 0
     n_total = 0
 
+    # Per-tile buffers for raw heatmap access (mirrors TrackNetDetector internals)
+    tile_xs: list[int] | None = None
+    tile_w: int | None = None
+    tile_bufs: list[deque] = []
+    device = det._device
+
     for frame_id, ts, frame in iter_frames(args.source):
         h, w = frame.shape[:2]
-        det._ensure_transforms(h, w)
-        det._buf.append(det._preprocess(frame))
-        if len(det._buf) < 3:
+
+        # Initialise tile layout
+        if tile_xs is None:
+            tile_xs = _compute_tiles(w, h, args.tile_overlap)
+            tile_w  = min(int(round(h * _W / _H)), w)
+            tile_bufs = [deque(maxlen=3) for _ in tile_xs]
+
+        for i, x0 in enumerate(tile_xs):
+            tile_bufs[i].append(_preprocess_tile(frame, x0, tile_w))
+
+        if len(tile_bufs[0]) < 3:
             continue
 
-        stacked = torch.cat(list(det._buf), dim=0).unsqueeze(0).to(det._device)
-        with torch.no_grad():
-            logits = det._model(stacked)[0]
-            hm = torch.sigmoid(logits[0, 2]).cpu().numpy()   # (H, W) in [0,1]
+        # Run all tiles, find best peak and its heatmap
+        best_peak = 0.0
+        best_hm: np.ndarray | None = None
+        best_x0 = 0
+        ball_xy: tuple[int, int] | None = None
 
-        peak = float(hm.max())
-        peaks.append(peak)
+        for i, x0 in enumerate(tile_xs):
+            stacked = torch.cat(list(tile_bufs[i]), dim=0).unsqueeze(0).to(device)
+            with torch.no_grad():
+                logits  = det._model(stacked)[0]
+                heatmap = torch.sigmoid(logits[0, 2])
+            hm   = heatmap.cpu().numpy()
+            peak = float(hm.max())
+            if peak > best_peak:
+                best_peak = peak
+                best_hm   = hm
+                best_x0   = x0
+                if peak >= args.conf:
+                    ym, xm = np.unravel_index(hm.argmax(), hm.shape)
+                    cx = int(x0 + xm * tile_w / _W)
+                    cy = int(ym * h / _H)
+                    ball_xy = (cx, cy)
+
+        peaks.append(best_peak)
         n_total += 1
 
-        # Heatmap → colour, resized to frame size
-        hm_u8 = (np.clip(hm, 0, 1) * 255).astype(np.uint8)
-        hm_color = cv2.applyColorMap(cv2.resize(hm_u8, (w, h)), cv2.COLORMAP_JET)
+        # Visualise
+        hm_u8     = (np.clip(best_hm, 0, 1) * 255).astype(np.uint8)
+        hm_full   = cv2.resize(hm_u8, (tile_w, h), interpolation=cv2.INTER_LINEAR)
+        hm_color  = cv2.applyColorMap(hm_full, cv2.COLORMAP_JET)
+
+        # Pad heatmap panel to full frame width
+        hm_canvas = np.zeros((h, w, 3), dtype=np.uint8)
+        hm_canvas[:, best_x0: best_x0 + tile_w] = hm_color
 
         vis = frame.copy()
-        if peak >= args.conf:
+        if ball_xy is not None:
             n_hit += 1
-            dets = det._postprocess(torch.from_numpy(hm))
-            if dets:
-                x1, y1, x2, y2 = (int(v) for v in dets[0].bbox)
-                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-                cv2.circle(vis, (cx, cy), 10, (0, 255, 0), 2)
-                cv2.putText(vis, f"{peak:.2f}", (cx + 12, cy),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.circle(vis, ball_xy, 12, (0, 255, 0), 2)
+            cv2.putText(vis, f"{best_peak:.2f}", (ball_xy[0] + 14, ball_xy[1]),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-        cv2.putText(vis, f"f={frame_id} peak={peak:.3f} thr={args.conf}",
+        cv2.putText(vis, f"f={frame_id} peak={best_peak:.3f} thr={args.conf}",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        cv2.putText(hm_canvas,
+                    f"tile x0={best_x0} tw={tile_w}",
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
-        combined = np.hstack([vis, hm_color])
+        combined = np.vstack([vis, hm_canvas])
         if writer is None:
             ch, cw = combined.shape[:2]
             writer = cv2.VideoWriter(args.out, cv2.VideoWriter_fourcc(*"mp4v"),
@@ -103,7 +139,7 @@ def main() -> None:
         if n_total % 100 == 0:
             arr = np.array(peaks[-100:])
             print(f"[f={frame_id:5d}] peak last100: "
-                  f"min={arr.min():.3f} mean={arr.mean():.3f} max={arr.max():.3f} "
+                  f"min={arr.min():.3f} mean={arr.mean():.3f} max={arr.max():.3f}  "
                   f"hit_rate={n_hit / n_total * 100:.1f}%")
 
         if args.max_frames and n_total >= args.max_frames:
@@ -118,8 +154,6 @@ def main() -> None:
     print(f"  peak  min/mean/max: {arr.min():.3f} / {arr.mean():.3f} / {arr.max():.3f}")
     print(f"  detections (>{args.conf}): {n_hit}  ({n_hit / max(n_total, 1) * 100:.1f}%)")
     print(f"  output video     : {args.out}")
-    print("\nIf max peak is near 0 → preprocessing/weights mismatch.")
-    print("If peaks are high but scattered → lower/raise --conf and inspect the video.")
 
 
 if __name__ == "__main__":
