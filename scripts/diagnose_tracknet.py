@@ -165,13 +165,40 @@ def main() -> None:
         print(f"  {name:32s}: max_sigmoid={sg.max():.3f}  "
               f"argmax_ch={int(sg.amax(dim=(1,2)).argmax())}")
 
+    # ── Tiling test: run on near-native-resolution 16:9 tiles ─────────────────
+    # Full height, width = h*16/9, overlapping horizontally to cover the frame.
+    tile_w = int(round(h * _W / _H))          # 16:9 tile at native height
+    tile_w = min(tile_w, w)
+    n_tiles = max(1, int(np.ceil((w - tile_w) / (tile_w * 0.7))) + 1)
+    if n_tiles == 1:
+        xs = [0]
+    else:
+        xs = [int(round(i * (w - tile_w) / (n_tiles - 1))) for i in range(n_tiles)]
+    print(f"\n── tiling test ({n_tiles} tiles, each {tile_w}x{h} → {_W}x{_H}) ──")
+    print(f"  tile resize scale: {_W/tile_w:.3f}  "
+          f"(12px ball → ~{12*_W/tile_w:.1f}px)")
+    best_overall = 0.0
+    for xi, x0 in enumerate(xs):
+        crops = [f[:, x0:x0 + tile_w] for f in frames]
+        chw = []
+        for c in crops:
+            rgb = cv2.cvtColor(c, cv2.COLOR_BGR2RGB)
+            rs = cv2.resize(rgb, (_W, _H), interpolation=cv2.INTER_LINEAR)
+            t = rs.astype(np.float32) / 255.0
+            t = (t - _MEAN) / _STD
+            chw.append(torch.from_numpy(t).permute(2, 0, 1).contiguous())
+        lg = _forward(model, _stack(chw), device)
+        sg = torch.sigmoid(lg)
+        peak = float(sg.max())
+        best_overall = max(best_overall, peak)
+        ch = int(sg.amax(dim=(1, 2)).argmax())
+        print(f"  tile {xi} x=[{x0:4d}:{x0+tile_w:4d}]: max_sigmoid={peak:.3f}  argmax_ch={ch}")
+    print(f"  >>> best tile peak = {best_overall:.3f}")
+
     print("\nInterpretation:")
-    print("  - If the ball becomes <2px after scaling → resolution is the problem")
-    print("    (need cropping/tiling, not a full-frame 512x288 resize).")
-    print("  - If one preprocessing variant gives a high peak → that is the")
-    print("    correct preprocessing; adopt it in tracknet.py.")
-    print("  - If ALL variants stay dead → the checkpoint does not match this")
-    print("    architecture/domain; revisit the weights.")
+    print("  - If a TILE peak is high (>0.5) while full-frame stays ~0.007 →")
+    print("    CONFIRMED: resolution was the problem; adopt tiling in tracknet.py.")
+    print("  - If tiles are still dead → revisit preprocessing/weights.")
 
 
 if __name__ == "__main__":
