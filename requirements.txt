@@ -10,8 +10,10 @@ torchvision>=0.18.0
 # ONNX runtime for YOLOX inference (GPU build)
 onnxruntime-gpu>=1.18.0
 
-# ── Tracking (boxmot bundles StrongSORT, ByteTrack, OSNet ReID) ───────────────
-boxmot>=10.0.0
+# ── Tracking (Roboflow trackers: ByteTrack, SORT, OC-SORT, BoT-SORT) ─────────
+# trackers requires numpy>=2.0.2; supervision provides sv.Detections format
+trackers>=2.4.0
+supervision>=0.29.0
 
 # ── OCR ───────────────────────────────────────────────────────────────────────
 easyocr>=1.7.0

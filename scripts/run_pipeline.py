@@ -51,11 +51,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--conf-ball", type=float, default=0.35, help="Ball detection threshold")
     p.add_argument(
         "--tracker",
-        choices=["strongsort", "bytetrack"],
-        default="strongsort",
-        help="MOT algorithm (strongsort recommended for dense scenes)",
+        choices=["bytetrack"],
+        default="bytetrack",
+        help="MOT algorithm",
     )
-    p.add_argument("--reid-model", default="osnet_x0_25", help="ReID model for StrongSORT")
+    p.add_argument("--track-thresh", type=float, default=0.5,
+                   help="Min detection confidence to start a track")
+    p.add_argument("--track-buffer", type=int, default=30,
+                   help="Frames to keep a lost track alive")
     p.add_argument("--skip-frames", type=int, default=0, help="Process every N+1 frames")
     p.add_argument("--no-ocr", action="store_true", help="Disable jersey number OCR")
     p.add_argument("--framing-mode", choices=["auto", "ball", "wide"], default="auto")
@@ -90,7 +93,11 @@ def main() -> None:
     )
 
     logger.info(f"Init tracker: {args.tracker}")
-    tracker = PlayerTracker(method=args.tracker, reid_model=args.reid_model, device=args.device)
+    tracker = PlayerTracker(
+        method=args.tracker,
+        track_activation_threshold=args.track_thresh,
+        lost_track_buffer=args.track_buffer,
+    )
     ball_tracker = BallTracker(ball_class_id=_COCO_SPORTS_BALL)
 
     ocr = None if args.no_ocr else JerseyOCR(use_gpu=ort_device == "cuda")
