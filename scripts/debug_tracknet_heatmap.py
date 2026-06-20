@@ -8,7 +8,9 @@ For each frame it writes a stacked video:
                - all raw candidates (yellow dots)
                - the tracked ball (green circle)
                - predicted position when the ball is Kalman-interpolated (cyan)
-  [ bottom ] best-tile heatmap (JET), placed at its tile offset
+  [ bottom ] winning-tile heatmap (JET) when its peak >= conf, outlined in
+             white at its tile offset; otherwise a black "LOST" panel (the
+             model is blind on this frame, it is NOT scanning for the ball)
 
 Prints per-interval stats: raw detection rate vs. tracked-visible rate, so
 you can see how much the motion-aware tracker recovers.
@@ -134,10 +136,21 @@ def main() -> None:
         # Track peak histogram
         peak_hist[min(int(best_peak * 10), 10)] += 1
 
-        if best_hm is not None:
+        # Only draw the heatmap tile when the model is actually confident.
+        # Below conf, "best tile" is just argmax over noise and would flicker
+        # left/right every frame — which looks like a search animation but is
+        # meaningless (all tiles are always evaluated). Show black = lost.
+        ball_visible = best_hm is not None and best_peak >= args.conf
+        if ball_visible:
             hm_u8 = (np.clip(best_hm, 0, 1) * 255).astype(np.uint8)
             hm_color = cv2.applyColorMap(cv2.resize(hm_u8, (tile_w, h)), cv2.COLORMAP_JET)
             hm_canvas[:, best_x0: best_x0 + tile_w] = hm_color
+            # Outline the winning tile so it is clear which crop fired.
+            cv2.rectangle(hm_canvas, (best_x0, 0), (best_x0 + tile_w - 1, h - 1),
+                          (255, 255, 255), 2)
+        else:
+            cv2.putText(hm_canvas, "LOST (all tiles below conf)",
+                        (20, h // 2), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (80, 80, 80), 2)
 
         # ── Draw overlays ────────────────────────────────────────────────────
         vis = frame.copy()
@@ -196,6 +209,8 @@ def main() -> None:
     print("\n  Inspect the video: green=detected ball, cyan=predicted (Kalman),")
     print("  yellow dots=raw candidates. A good track stays on the ball and the")
     print("  green marker should NOT jump to stray yellow dots when the ball is lost.")
+    print("  Bottom panel: JET heatmap of the winning tile when peak>=conf,")
+    print("  otherwise black 'LOST' (the model is blind, NOT searching).")
     print(f"\n  Tip: if peak distribution is mostly in 0.3-0.5 bucket,")
     print(f"  try --conf 0.3 to increase detection rate (at cost of more false positives).")
 
