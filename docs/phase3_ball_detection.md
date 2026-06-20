@@ -63,3 +63,62 @@ Phase 2 では人物検出は実用域に達したが、**ボール検出は COC
 | WASB-SBDT 重み | MIT |
 | TrackNetV3 (qaz812345) | コード公開（研究用）|
 | gdown | MIT |
+
+---
+
+## 評価結果（Phase 3 完了時）
+
+3840×800 のウルトラワイドパノラマ映像（`volley-2.mp4`、600フレーム）で評価した。
+
+### 検出パイプラインの確立
+
+| 課題 | 対策 | 効果 |
+|---|---|---|
+| 全フレーム解像度では 12px のボールが ~1.6px に潰れる | ネイティブ高さの 16:9 重複タイル4枚に分割し各タイルで推論 | モデルが反応（最大ピーク 0.926）|
+| 前処理不一致で出力が死んでいた | WASB に合わせ BGR→RGB＋ImageNet 正規化、skip 連結順、チェックポイント属性名を一致 | strict load 成功 |
+| 単一最大ピークだと見失い時に誤ピークへ飛ぶ | 連結成分の重み付き重心で複数候補を抽出し、WASB OnlineTracker 流の動き整合選択 | トラック安定化 |
+
+### 指標
+
+| 指標 | 値 |
+|---|---|
+| 生検出率（conf=0.5）| 32.8% |
+| フレーミング実用率（検出＋Kalman補間）| 〜68%（coast+hold 込み）|
+| ヒートマップ最大ピーク | 0.926 |
+| ピーク分布 | **二峰性（confident-or-blind）**。閾値 0.5 が谷で最適 |
+
+閾値分析により、conf を下げても二峰の谷より下は誤検出が増えるだけと確定
+（conf=0.3 でもサーブ前ドリブルは改善せず）。閾値チューニングは打ち止め。
+
+### 既知の失敗モード（CLAUDE.md に詳細記録）
+
+| モード | 状況 | 原因 | 対策 |
+|---|---|---|---|
+| 1. 低速・静止 | サーブ前の床ドリブル | 3フレーム間の動きがなく時系列パターンが出ない | **Phase 3.5 で対策（最重要）**|
+| 2. 高速スパイク | アタックで対角へ | モーションブラーで3フレーム軌跡が崩れる | Kalman 外挿で橋渡し |
+| 3. 高い軌道 | 高く上がったボール | タイル境界分断／学習データ外の可能性 | Kalman 外挿で橋渡し／Phase 3.5 調査 |
+
+### トラッキング補間の設計判断
+
+- `MAX_MISS_FRAMES=25`：スパイト相当（0.5〜1秒）の見失いを橋渡し。
+- **速度減衰（0.85/frame）**：スパイクはボールを見失う瞬間に方向が変わるため、
+  見失い前の速度をそのまま外挿すると「自信を持って間違った軌跡」を描く。
+  減衰により予測点は数フレーム coast 後に停止し、ドリフトを ~6.7 フレーム分に有界化。
+- 放物線の長距離外挿は2次発散で暴走するため見失い時は不使用。Smoother はギャップで reset。
+
+### 結論
+
+TrackNetV2（WASB-SBDT）によるボール検出の基盤を確立し、限界（3失敗モード）を
+定量的に特定。Kalman 橋渡しでフレーミング実用率 〜68% を達成。サーブ起点の捕捉
+（モード1）は次フェーズ **Phase 3.5** の課題として計画化済み。
+
+### 再現手順
+
+```bash
+# 閾値・ギャップ分析
+python scripts/analyze_detection_rate.py --source <video> --model models/tracknet_volleyball.pt --max-frames 600
+# 検出＋トラッキングの可視化（緑=検出, シアン=Kalman予測, 黄=候補）
+python scripts/debug_tracknet_heatmap.py --source <video> --model models/tracknet_volleyball.pt --out heatmap_debug.mp4 --max-frames 600
+# フルパイプライン
+python scripts/run_pipeline.py --source <video> --person-model models/yolox_m.onnx --ball-model models/tracknet_volleyball.pt --out-video out.mp4
+```
