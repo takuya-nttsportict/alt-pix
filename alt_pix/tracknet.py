@@ -34,6 +34,55 @@ logger = logging.getLogger(__name__)
 _W = 512
 _H = 288
 
+# WASB-SBDT preprocessing: ToTensor (÷255) → Normalize(ImageNet mean/std) on RGB.
+# Verified against src/dataloaders/__init__.py build_img_transforms().
+_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+
+# ── Affine warp helpers (faithful copy of WASB src/utils/image.py) ───────────
+# WASB maps a centred square region (side = max(h, w)) of the source frame into
+# the (W, H) input via an affine transform, then maps heatmap peaks back with
+# the inverse.  We replicate exactly so coordinates match the training domain.
+
+def _get_dir(src_point: list[float], rot_rad: float) -> list[float]:
+    sn, cs = np.sin(rot_rad), np.cos(rot_rad)
+    return [src_point[0] * cs - src_point[1] * sn,
+            src_point[0] * sn + src_point[1] * cs]
+
+
+def _get_3rd_point(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    direct = a - b
+    return b + np.array([-direct[1], direct[0]], dtype=np.float32)
+
+
+def _get_affine_transform(center, scale, output_size, inv: int = 0) -> np.ndarray:
+    scale = np.array([scale, scale], dtype=np.float32)
+    src_w = scale[0]
+    dst_w, dst_h = output_size
+
+    src_dir = _get_dir([0, src_w * -0.5], 0.0)
+    dst_dir = np.array([0, dst_w * -0.5], np.float32)
+
+    src = np.zeros((3, 2), dtype=np.float32)
+    dst = np.zeros((3, 2), dtype=np.float32)
+    src[0, :] = center
+    src[1, :] = center + src_dir
+    dst[0, :] = [dst_w * 0.5, dst_h * 0.5]
+    dst[1, :] = np.array([dst_w * 0.5, dst_h * 0.5], np.float32) + dst_dir
+    src[2:, :] = _get_3rd_point(src[0, :], src[1, :])
+    dst[2:, :] = _get_3rd_point(dst[0, :], dst[1, :])
+
+    if inv:
+        return cv2.getAffineTransform(np.float32(dst), np.float32(src))
+    return cv2.getAffineTransform(np.float32(src), np.float32(dst))
+
+
+def _affine_point(pt: tuple[float, float], t: np.ndarray) -> tuple[float, float]:
+    v = np.array([pt[0], pt[1], 1.0], dtype=np.float32)
+    out = t @ v
+    return float(out[0]), float(out[1])
+
 
 # ── Building blocks ───────────────────────────────────────────────────────────
 
@@ -195,6 +244,11 @@ class TrackNetDetector:
 
         self._buf: deque[torch.Tensor] = deque(maxlen=3)
 
+        # Affine transforms are derived lazily once the first frame size is known.
+        self._trans: np.ndarray | None = None       # original → (W, H)
+        self._trans_inv: np.ndarray | None = None    # (W, H) → original
+        self._src_hw: tuple[int, int] | None = None
+
         logger.info(
             f"TrackNetV2 loaded: {model_path}  "
             f"device={self._device}  input={self._w}×{self._h}  conf_thr={conf_thr}"
@@ -203,6 +257,7 @@ class TrackNetDetector:
     def detect(self, frame: np.ndarray) -> list[Detection]:
         """Return a list of at most 1 Detection (the ball) or [] if not found."""
         h_orig, w_orig = frame.shape[:2]
+        self._ensure_transforms(h_orig, w_orig)
         self._buf.append(self._preprocess(frame))
 
         if len(self._buf) < 3:
@@ -214,24 +269,39 @@ class TrackNetDetector:
             logits = self._model(stacked)[0]          # (1, 3, H, W)
             heatmap = torch.sigmoid(logits[0, 2])     # (H, W) — most recent frame
 
-        return self._postprocess(heatmap, w_orig, h_orig)
+        return self._postprocess(heatmap)
 
     def reset(self) -> None:
         """Clear the frame buffer (call after stream discontinuity)."""
         self._buf.clear()
 
-    def _preprocess(self, frame: np.ndarray) -> torch.Tensor:
-        """Resize to (W, H), normalise to [0,1]. Returns (3, H, W) float32."""
-        resized = cv2.resize(frame, (self._w, self._h), interpolation=cv2.INTER_LINEAR)
-        t = torch.from_numpy(resized).float() / 255.0   # (H, W, 3)
-        return t.permute(2, 0, 1)                        # (3, H, W)
+    # ── private ───────────────────────────────────────────────────────────────
 
-    def _postprocess(
-        self,
-        heatmap: torch.Tensor,
-        w_orig: int,
-        h_orig: int,
-    ) -> list[Detection]:
+    def _ensure_transforms(self, h: int, w: int) -> None:
+        """Build the affine warp + inverse for the current frame size (WASB).
+
+        WASB uses center=(w/2,h/2), scale=max(h,w); it maps a centred square
+        region into (W, H).  Cached until the frame size changes.
+        """
+        if self._src_hw == (h, w):
+            return
+        center = np.array([w / 2.0, h / 2.0], dtype=np.float32)
+        scale = float(max(h, w))
+        self._trans = _get_affine_transform(center, scale, (self._w, self._h), inv=0)
+        self._trans_inv = _get_affine_transform(center, scale, (self._w, self._h), inv=1)
+        self._src_hw = (h, w)
+        logger.debug(f"TrackNet: affine transform built for frame {w}×{h}")
+
+    def _preprocess(self, frame: np.ndarray) -> torch.Tensor:
+        """BGR→RGB, affine warp to (W, H), ÷255, ImageNet normalise. Returns (3, H, W)."""
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        warped = cv2.warpAffine(rgb, self._trans, (self._w, self._h),
+                                flags=cv2.INTER_LINEAR)            # (H, W, 3) uint8 RGB
+        t = warped.astype(np.float32) / 255.0
+        t = (t - _MEAN) / _STD                                     # ImageNet normalise
+        return torch.from_numpy(t).permute(2, 0, 1).contiguous()   # (3, H, W)
+
+    def _postprocess(self, heatmap: torch.Tensor) -> list[Detection]:
         hm = heatmap.cpu().numpy()
         peak = float(hm.max())
 
@@ -241,9 +311,11 @@ class TrackNetDetector:
 
         ym, xm = np.unravel_index(hm.argmax(), hm.shape)
 
-        cx = float(xm) * w_orig / self._w
-        cy = float(ym) * h_orig / self._h
+        # Map peak from (W, H) heatmap space back to original frame via inverse affine.
+        cx, cy = _affine_point((float(xm), float(ym)), self._trans_inv)
 
+        w_orig = self._src_hw[1]
+        h_orig = self._src_hw[0]
         r = max(min(w_orig, h_orig) * 0.02, 4.0)
 
         logger.debug(f"TrackNet: ball=({cx:.1f},{cy:.1f})  peak={peak:.3f}  r={r:.1f}")
