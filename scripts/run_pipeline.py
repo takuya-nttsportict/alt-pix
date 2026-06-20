@@ -40,6 +40,7 @@ from alt_pix.jersey_ocr import JerseyOCR
 from alt_pix.log_config import setup_logging
 from alt_pix.output import JSONLWriter, VideoWriter, _make_record
 from alt_pix.stream import iter_frames
+from alt_pix.tracknet import TrackNetDetector
 from alt_pix.tracker import PlayerTracker
 from alt_pix.visualizer import annotate
 
@@ -53,9 +54,11 @@ def parse_args() -> argparse.Namespace:
 
     # Models
     p.add_argument("--person-model", default="models/yolox_m.onnx")
-    p.add_argument("--ball-model",   default="models/yolox_s_ball.onnx")
+    p.add_argument("--ball-model",   default="models/tracknet_volleyball.pt",
+                   help="Ball detector. .pt = TrackNet (recommended), .onnx = YOLOX")
     p.add_argument("--conf-person",  type=float, default=0.4)
-    p.add_argument("--conf-ball",    type=float, default=0.35)
+    p.add_argument("--conf-ball",    type=float, default=0.5,
+                   help="Ball threshold (heatmap peak for TrackNet, score for YOLOX)")
 
     # Court calibration
     p.add_argument("--court", default=None,
@@ -114,10 +117,15 @@ def main() -> None:
     )
 
     logger.info("Loading ball detector …")
-    ball_det = YOLOXDetector(
-        args.ball_model, conf_thr=args.conf_ball,
-        detect_classes={_COCO_SPORTS_BALL}, device=ort_device,
-    )
+    if Path(args.ball_model).suffix == ".pt":
+        ball_det = TrackNetDetector(
+            args.ball_model, conf_thr=args.conf_ball, device=ort_device,
+        )
+    else:
+        ball_det = YOLOXDetector(
+            args.ball_model, conf_thr=args.conf_ball,
+            detect_classes={_COCO_SPORTS_BALL}, device=ort_device,
+        )
 
     logger.info("Initialising tracker …")
     tracker = PlayerTracker(

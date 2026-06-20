@@ -39,10 +39,14 @@ class ParabolicSmoother:
         self._min = min_points
         self._buf: deque[Point2D] = deque(maxlen=window)
 
+    def reset(self) -> None:
+        """Drop all history. Call after a tracking gap so the next fit does not
+        span the discontinuity (which would bend the smoothed path)."""
+        self._buf.clear()
+
     def update(self, frame_id: int, x: float, y: float) -> tuple[float, float]:
         """Add a new point and return the smoothed (x, y) for this frame."""
         self._buf.append(Point2D(frame_id, x, y))
-
         if len(self._buf) < self._min:
             return x, y
 

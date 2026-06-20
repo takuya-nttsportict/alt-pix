@@ -1,4 +1,16 @@
-"""Ball tracking: YOLOX detection + Kalman filter interpolation.
+"""Ball tracking: motion-aware candidate selection + Kalman interpolation.
+
+The detector (TrackNet) emits MULTIPLE ball candidates per frame.  Selecting
+the single highest-confidence one independently each frame makes the track
+jump to spurious heatmap peaks whenever the ball is occluded or lost.
+
+To match the accuracy of the WASB-SBDT reference (nttcom, MIT), candidate
+selection uses the same OnlineTracker strategy:
+  1. constant-acceleration motion prediction from the last 3 positions,
+  2. gating: reject candidates farther than `max_disp` from the previous
+     position,
+  3. scoring: prefer candidates close to the predicted position
+     (score = conf - quality_weight × dist_to_prediction / max_disp).
 
 When the ball is not detected (fast motion, occlusion, net crossing),
 a constant-velocity Kalman filter predicts the position for up to
@@ -7,6 +19,7 @@ MAX_MISS_FRAMES frames before marking the ball as lost.
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 
 import numpy as np
@@ -14,7 +27,26 @@ import numpy as np
 from .detector import Detection, _COCO_SPORTS_BALL
 from .trajectory import ParabolicSmoother
 
-MAX_MISS_FRAMES = 5  # frames to keep predicting without a detection
+MAX_MISS_FRAMES = 25  # frames to keep predicting without a detection.
+# A volleyball spike crosses the court in ~0.5–1s (12–25 frames @25fps) with
+# heavy motion blur that TrackNetV2 cannot follow. We bridge that gap with the
+# constant-velocity Kalman prediction. 25 frames is the practical ceiling: a
+# longer constant-velocity extrapolation diverges badly (the ball decelerates,
+# bounces, or is received), so beyond this we declare the ball lost.
+MAX_DISP = 300.0     # max ball displacement between frames (px); WASB default
+QUALITY_WEIGHT = 0.5  # weight of prediction-proximity vs. raw confidence
+# Velocity damping applied to the Kalman state on each predict-only (no
+# detection) step. A spike changes the ball's direction at the exact moment
+# detection is lost, so extrapolating the pre-loss velocity for many frames
+# draws a confidently-wrong path across the court. Damping makes the predicted
+# point coast a few frames in the last direction then settle, bounding the
+# drift to ~1/(1-d) frames of motion regardless of MAX_MISS_FRAMES.
+PRED_VEL_DAMPING = 0.85
+
+
+def _center(det: Detection) -> np.ndarray:
+    x1, y1, x2, y2 = det.bbox
+    return np.array([(x1 + x2) / 2.0, (y1 + y2) / 2.0], dtype=np.float64)
 
 
 @dataclass
@@ -51,9 +83,14 @@ class BallKalmanFilter:
     def init(self, cx: float, cy: float) -> None:
         self._x = np.array([cx, cy, 0.0, 0.0], dtype=np.float64)
 
-    def predict(self) -> tuple[float, float]:
+    def predict(self, vel_damping: float = 1.0) -> tuple[float, float]:
         assert self._x is not None
         self._x = self._F @ self._x
+        # Damp velocity AFTER advancing position so this step uses the full
+        # velocity and subsequent predict-only steps decelerate.
+        if vel_damping != 1.0:
+            self._x[2] *= vel_damping
+            self._x[3] *= vel_damping
         self._P = self._F @ self._P @ self._F.T + self._Q
         return float(self._x[0]), float(self._x[1])
 
@@ -80,20 +117,61 @@ class BallTracker:
         self,
         ball_class_id: int = _COCO_SPORTS_BALL,
         smooth: bool = True,
+        max_disp: float = MAX_DISP,
+        quality_weight: float = QUALITY_WEIGHT,
     ) -> None:
         self._cls = ball_class_id
         self._kf = BallKalmanFilter()
         self._smoother = ParabolicSmoother() if smooth else None
         self._miss = 0
         self._frame_id = 0
+        self._max_disp = max_disp
+        self._quality_weight = quality_weight
+        # Last 3 accepted (visible) positions, newest last — for motion prediction.
+        self._hist: deque[np.ndarray] = deque(maxlen=3)
 
-    def _best_ball(self, detections: list[Detection]) -> Detection | None:
+    def _predict_xy(self) -> np.ndarray | None:
+        """Constant-acceleration prediction from the last 3 positions (WASB)."""
+        if len(self._hist) < 3:
+            return None
+        xy3, xy2, xy1 = self._hist[0], self._hist[1], self._hist[2]  # oldest→newest
+        acc = (xy1 - xy2) - (xy2 - xy3)
+        vel = (xy1 - xy2) + acc
+        return xy1 + vel + acc / 2.0
+
+    def _select_ball(self, detections: list[Detection]) -> Detection | None:
+        """Pick the candidate that is both confident and motion-consistent.
+
+        Implements WASB OnlineTracker selection: gate by max_disp from the
+        previous position, then score by conf minus distance to the
+        motion-predicted position.
+        """
         balls = [d for d in detections if d.class_id == self._cls]
-        return max(balls, key=lambda d: d.conf) if balls else None
+        if not balls:
+            return None
+
+        last = self._hist[-1] if self._hist else None
+        xy_pred = self._predict_xy()
+
+        # Gate: drop candidates too far from the previous accepted position.
+        if last is not None:
+            gated = [d for d in balls
+                     if np.linalg.norm(_center(d) - last) < self._max_disp]
+            if gated:
+                balls = gated
+
+        def score(d: Detection) -> float:
+            s = d.conf
+            if xy_pred is not None:
+                dist = float(np.linalg.norm(_center(d) - xy_pred))
+                s -= self._quality_weight * (dist / self._max_disp)
+            return s
+
+        return max(balls, key=score)
 
     def update(self, detections: list[Detection]) -> BallState:
         self._frame_id += 1
-        det = self._best_ball(detections)
+        det = self._select_ball(detections)
 
         if det is not None:
             x1, y1, x2, y2 = det.bbox
@@ -107,6 +185,7 @@ class BallTracker:
                 px, py = self._kf.update(cx, cy)
 
             self._miss = 0
+            self._hist.append(np.array([px, py], dtype=np.float64))
 
             if self._smoother is not None:
                 sx, sy = self._smoother.update(self._frame_id, px, py)
@@ -114,16 +193,20 @@ class BallTracker:
 
             return BallState(x=px, y=py, visible=True, conf=det.conf, predicted=False)
 
-        # No detection — Kalman predict
+        # No detection — clear motion history (gap breaks the const-accel model)
+        # and reset the smoother so the next fit does not span the gap.
+        self._hist.clear()
+        if self._smoother is not None:
+            self._smoother.reset()
+
+        # Kalman predict to bridge the gap. Velocity is damped each step so the
+        # marker coasts a few frames in the last direction and then holds,
+        # instead of extrapolating a confidently-wrong path across the court
+        # (a spike reverses the ball's direction at the moment of loss).
+        # The diverging parabolic extrapolation is intentionally NOT used here.
         if self._kf.initialized and self._miss < MAX_MISS_FRAMES:
-            px, py = self._kf.predict()
+            px, py = self._kf.predict(vel_damping=PRED_VEL_DAMPING)
             self._miss += 1
-
-            if self._smoother is not None:
-                pred = self._smoother.predict(future_frames=self._miss)
-                if pred is not None:
-                    px, py = pred
-
-            return BallState(x=px, y=py, visible=True, conf=0.0, predicted=True, smoothed=self._smoother is not None)
+            return BallState(x=px, y=py, visible=True, conf=0.0, predicted=True)
 
         return BallState(x=0.0, y=0.0, visible=False, conf=0.0, predicted=False)

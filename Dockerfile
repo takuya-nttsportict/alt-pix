@@ -61,7 +61,8 @@ RUN pip install --no-cache-dir \
         "scipy>=1.13.0" \
         "tqdm>=4.66.0" \
         "pyyaml>=6.0.2" \
-        "loguru>=0.7.0"
+        "loguru>=0.7.0" \
+        "gdown>=5.1.0"
 
 # ── Application code ──────────────────────────────────────────────────────────
 COPY . .
