@@ -57,14 +57,12 @@ COPY . .
 
 # Smoke-test: CUDA availability is False at build time (no GPU during build);
 # runtime GPU access is confirmed separately via --gpus flag.
-RUN python -c "
-import numpy; print('numpy', numpy.__version__)
-import torch; print('torch', torch.__version__)
-import cv2; print('cv2', cv2.__version__)
-import av; print('av ok')
-import easyocr; print('easyocr ok')
-import onnxruntime; print('onnxruntime', onnxruntime.__version__)
-print('All imports OK')
-"
+RUN python -c "import numpy; print('numpy', numpy.__version__)" && \
+    python -c "import torch; print('torch', torch.__version__)" && \
+    python -c "import cv2; print('cv2', cv2.__version__)" && \
+    python -c "import av; print('av ok')" && \
+    python -c "import easyocr; print('easyocr ok')" && \
+    python -c "import onnxruntime; print('onnxruntime', onnxruntime.__version__)" && \
+    echo "All imports OK"
 
 CMD ["bash"]
