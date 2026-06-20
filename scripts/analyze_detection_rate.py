@@ -60,6 +60,7 @@ def main() -> None:
 
     # Per-frame best peak (across all tiles)
     peaks: list[float] = []
+    frame_ids: list[int] = []   # frame_id aligned with peaks
     # Per-tile peak distributions
     n_total = 0
 
@@ -89,6 +90,7 @@ def main() -> None:
             best_peak = max(best_peak, float(hm.max()))
 
         peaks.append(best_peak)
+        frame_ids.append(frame_id)
 
         if n_total % 100 == 0:
             so_far = np.array(peaks)
@@ -146,34 +148,46 @@ def main() -> None:
     # ── Gap-length analysis at conf=0.5 (can the Kalman bridge the misses?) ────
     thr = 0.5
     detected = peaks_arr > thr
-    gaps: list[int] = []
+    gaps: list[tuple[int, int]] = []   # (start_index, length) into peaks_arr
     run = 0
-    for d in detected:
+    for i, d in enumerate(detected):
         if not d:
             run += 1
         elif run > 0:
-            gaps.append(run)
+            gaps.append((i - run, run))
             run = 0
     if run > 0:
-        gaps.append(run)
+        gaps.append((len(detected) - run, run))
 
     print(f"\n── Miss-gap analysis at conf={thr} ──")
     if gaps:
-        gaps_arr = np.array(gaps)
-        bridgeable = int((gaps_arr <= 5).sum())   # MAX_MISS_FRAMES = 5
-        print(f"  {len(gaps)} gaps  total_missed={int(gaps_arr.sum())}  "
-              f"longest={gaps_arr.max()}  median={int(np.median(gaps_arr))}")
+        lengths = np.array([g[1] for g in gaps])
+        bridgeable = int((lengths <= 5).sum())   # MAX_MISS_FRAMES = 5
+        print(f"  {len(gaps)} gaps  total_missed={int(lengths.sum())}  "
+              f"longest={lengths.max()}  median={int(np.median(lengths))}")
         print(f"  gaps ≤5 frames (Kalman-bridgeable): {bridgeable}/{len(gaps)} "
               f"({100*bridgeable/len(gaps):.0f}%)")
-        gh, ge = np.histogram(gaps_arr, bins=[1, 2, 4, 6, 11, 21, 10**6])
+        gh, _ = np.histogram(lengths, bins=[1, 2, 4, 6, 11, 21, 10**6])
         labels = ["1", "2-3", "4-5", "6-10", "11-20", "21+"]
         for lab, cnt in zip(labels, gh):
             bar = "█" * min(int(cnt), 40)
             print(f"  gap {lab:6s}: {cnt:4d}  {bar}")
+
+        # Show WHERE the long gaps are, so they can be checked in the video.
+        long_gaps = sorted([g for g in gaps if g[1] >= 11],
+                           key=lambda g: g[1], reverse=True)
+        if long_gaps:
+            print(f"\n  Long gaps (≥11 frames) — scrub the video to these frames:")
+            for start_idx, length in long_gaps:
+                f0 = frame_ids[start_idx]
+                f1 = frame_ids[min(start_idx + length - 1, len(frame_ids) - 1)]
+                print(f"    frames {f0:5d}–{f1:5d}  ({length} frames missed)")
+            print("  If these sit at the clip start / between rallies → out of")
+            print("  play (expected). If mid-rally → genuine model failure.")
         print("\n  Interpretation:")
         print("  - Many short gaps (≤5) → Kalman interpolation fills them → good.")
         print("  - Few long gaps (>10) → ball genuinely out of play (timeout, dead")
-        print("    ball) OR model failure; check the video for those stretches.")
+        print("    ball) OR model failure; check the frame ranges above.")
     else:
         print("  No gaps — ball detected every frame.")
 
