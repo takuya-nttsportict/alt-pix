@@ -55,18 +55,24 @@ class ROI:
 
 
 # ── 平滑化プロファイル（放送的＝滑らかさ優先のデフォルト） ─────────────────────────
-# pan は zoom より速く追える（観客は横移動には寛容、伸縮の往復には敏感）。
-_PAN_ALPHA = 0.12          # 中心 EMA 係数（低いほど滑らか）
-_ZOOM_ALPHA = 0.06         # サイズ EMA 係数（pan より緩く＝ズーム往復を抑制）
-_MAX_PAN_FRAC = 0.04       # 1 フレームの中心移動上限（フレーム幅に対する割合）
-_MAX_ZOOM_RATE = 0.03      # 1 フレームのサイズ変化上限（現サイズに対する割合）
-_DEADZONE_FRAC = 0.03      # この範囲内のターゲット中心移動は無視（pan 凍結）
-_LOOKAHEAD_FRAMES = 3.0    # ボール速度をこのフレーム数ぶん先読み（控えめ）
-_LOOKAHEAD_MAX_FRAC = 0.15  # 先読み量の上限（フレーム幅に対する割合）
+# NG 評価 (2026-06) で判明した問題と調律:
+#   - ボール左右追従でカメラがスウェーする: _W_BALL_VISIBLE を下げ、
+#     選手集団重心をアンカーとして利かせる。
+#   - pan 速度が速すぎる（カクつく）: _PAN_ALPHA と _MAX_PAN_FRAC を大幅に下げる。
+#   放送的には「選手集団がほぼ中心に収まり、ボールが消えても画が揺れない」を優先。
+_PAN_ALPHA = 0.06          # 中心 EMA 係数（下げて追従を遅く、揺れを抑制）
+_ZOOM_ALPHA = 0.04         # サイズ EMA 係数（pan より緩く＝ズーム往復を抑制）
+_MAX_PAN_FRAC = 0.015      # 1 フレームの中心移動上限（フレーム幅比; 0.04→0.015 に削減）
+_MAX_ZOOM_RATE = 0.02      # 1 フレームのサイズ変化上限（現サイズ比）
+_DEADZONE_FRAC = 0.04      # この範囲内のターゲット中心移動は無視（0.03→0.04 に拡大）
+_LOOKAHEAD_FRAMES = 1.5    # ボール速度の先読み（控えめ方向にさらに削減）
+_LOOKAHEAD_MAX_FRAC = 0.08  # 先読み量の上限（フレーム幅比）
 
 # ボール確度ごとの合成重み（加重合成の肝）。
-_W_BALL_VISIBLE = 0.75     # 検出フレーム: ボール主体
-_W_BALL_PREDICTED = 0.45   # Kalman 補間: 選手集団へ寄せ始める
+# NG 評価でボール追従強すぎ判明 → _W_BALL_VISIBLE を 0.75→0.45 に下げる。
+# 選手集団重心をアンカーにし、ボール位置は補正程度に留める（放送的挙動）。
+_W_BALL_VISIBLE = 0.45     # 検出フレーム: ボールは補正役（選手集団重心が主）
+_W_BALL_PREDICTED = 0.25   # Kalman 補間: さらに選手集団に寄せる
 _W_BALL_LOST = 0.0         # 喪失: 選手集団のみ
 
 # ROI サイズの制約（フレームに対する割合）。
@@ -235,15 +241,29 @@ class FramingCalculator:
         return self._size + step
 
     def _clamp_roi(self, cx: float, cy: float, w: float, h: float) -> ROI:
-        """アスペクト維持・最小/最大サイズ・フレーム内クランプを適用。"""
+        """アスペクト維持・最小/最大サイズ・フレーム内クランプを適用。
+
+        フレーム境界クランプ後にアスペクト比を再適用する。
+        フレームが出力アスペクト比より横長（例: 2160×650 ≈ 3.3:1）の場合、
+        高さは常にフレーム高に頭打ちされ、幅が h×aspect で確定する。
+        この再計算を省くとフレームごとにアスペクト比がばらつき映像が歪む。
+        """
         w = float(np.clip(w, self._fw * _MIN_ROI_FRAC, self._fw * _MAX_ROI_FRAC))
         h = float(np.clip(h, self._fh * _MIN_ROI_FRAC, self._fh * _MAX_ROI_FRAC))
+        # 目標アスペクト比に合わせる。
         if w / h > self._aspect:
             h = w / self._aspect
         else:
             w = h * self._aspect
+        # フレーム境界クランプ後、はみ出した側を縮め、もう一方の辺もアスペクト再適用。
+        if w > self._fw:
+            w = float(self._fw)
+            h = w / self._aspect
+        if h > self._fh:
+            h = float(self._fh)
+            w = h * self._aspect
+        # 高さ再クランプ後に幅がまたはみ出す可能性（超横長フレーム）。
         w = min(w, self._fw)
-        h = min(h, self._fh)
         x = int(np.clip(cx - w / 2, 0, self._fw - w))
         y = int(np.clip(cy - h / 2, 0, self._fh - h))
         return ROI(x=x, y=y, w=int(w), h=int(h))

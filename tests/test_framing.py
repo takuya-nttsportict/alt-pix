@@ -134,6 +134,29 @@ def test_zoom_is_rate_limited():
     assert rate <= 0.03 + 0.02, f"zoom rate {rate:.3f} exceeded cap"
 
 
+def test_aspect_ratio_constant_across_frames():
+    """ROI aspect ratio must stay 16:9 every frame — no per-frame distortion.
+
+    Regression test for the Phase 5 NG finding: when the source is wider than
+    16:9 (e.g. 2160×650), the frame-bound clamp was breaking aspect, causing
+    the rendered video to stretch/squash frame-to-frame.
+    """
+    # Use a wide-crop source like the evaluation video (2160×650, aspect 3.32:1).
+    fr = FramingCalculator(2160, 650, output_aspect=16 / 9, mode="auto")
+    players = _players(1080)
+    for state in [
+        _ball(900, 300),                              # visible, tight
+        _ball(1500, 200),                             # visible, right edge
+        _ball(0, 0, visible=False),                   # lost
+        _ball(960, 300, predicted=True),              # predicted
+    ] * 15:
+        roi = fr.compute(state, players)
+        aspect = roi.w / max(roi.h, 1)
+        assert abs(aspect - 16 / 9) < 0.05, (
+            f"aspect {aspect:.3f} != 16/9 for ROI {roi.w}×{roi.h}"
+        )
+
+
 def _run_all() -> None:
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

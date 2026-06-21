@@ -57,14 +57,28 @@ def _parse_size(s: str) -> tuple[int, int]:
 
 
 def _crop_resize(frame: np.ndarray, roi: dict, out_size: tuple[int, int]) -> np.ndarray:
-    """Crop frame to ROI (clamped to bounds) and resize to out_size."""
+    """Crop frame to ROI then fit-resize to out_size preserving aspect ratio.
+
+    The ROI should already have the target aspect ratio (enforced in framing.py),
+    so the letterbox padding should be zero in practice. Fit-resize is used
+    defensively so any rounding in the stored integer ROI never causes stretching.
+    """
     fh, fw = frame.shape[:2]
     x = max(0, min(int(roi["x"]), fw - 1))
     y = max(0, min(int(roi["y"]), fh - 1))
     w = max(1, min(int(roi["w"]), fw - x))
     h = max(1, min(int(roi["h"]), fh - y))
     crop = frame[y:y + h, x:x + w]
-    return cv2.resize(crop, out_size, interpolation=cv2.INTER_LINEAR)
+    ow, oh = out_size
+    ch, cw = crop.shape[:2]
+    # Scale uniformly; if ROI is exactly the right aspect the canvas fill is 0px.
+    scale = min(ow / cw, oh / ch)
+    rw, rh = max(1, int(cw * scale)), max(1, int(ch * scale))
+    resized = cv2.resize(crop, (rw, rh), interpolation=cv2.INTER_LINEAR)
+    canvas = np.zeros((oh, ow, 3), np.uint8)
+    ox, oy = (ow - rw) // 2, (oh - rh) // 2
+    canvas[oy:oy + rh, ox:ox + rw] = resized
+    return canvas
 
 
 def main() -> None:
