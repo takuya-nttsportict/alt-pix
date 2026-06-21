@@ -143,6 +143,7 @@ class TeamClassifier:
         self._buffer: list[np.ndarray] = []
         self._frames_seen = 0
         self._siglip = None  # lazy
+        self._last_margins: dict[int, float] = {}  # track_id -> normalised margin
 
         if backend == "siglip":
             self._try_load_siglip()
@@ -217,6 +218,27 @@ class TeamClassifier:
         )
         return d.min(axis=1)
 
+    def assignment_margin(self, embeddings: np.ndarray) -> np.ndarray:
+        """Normalised confidence margin per embedding: (d2-d1)/(d2+d1) in [0,1].
+
+        d1/d2 are the distances to the nearest / second-nearest (here: the other)
+        team centroid. ~1 means the player sits squarely on one uniform cluster;
+        ~0 means it is ambiguous (equidistant from both teams — a likely error or
+        a non-team uniform such as a referee).
+        """
+        if self._centroids is None or len(embeddings) == 0:
+            return np.full(len(embeddings), 0.0)
+        d = np.linalg.norm(
+            np.asarray(embeddings)[:, None, :] - self._centroids[None, :, :], axis=2
+        )
+        ds = np.sort(d, axis=1)
+        return (ds[:, 1] - ds[:, 0]) / (ds[:, 1] + ds[:, 0] + 1e-8)
+
+    @property
+    def last_margins(self) -> dict[int, float]:
+        """{track_id: assignment margin} from the most recent ready `update`."""
+        return self._last_margins
+
     @property
     def ready(self) -> bool:
         return self._centroids is not None
@@ -263,6 +285,8 @@ class TeamClassifier:
 
         labels = self.predict(emb)
         dists = self.distance_to_teams(emb)
+        margins = self.assignment_margin(emb)
         team_map = {tid: int(lbl) for tid, lbl in zip(ids, labels)}
         dist_map = {tid: float(dd) for tid, dd in zip(ids, dists)}
+        self._last_margins = {tid: float(mm) for tid, mm in zip(ids, margins)}
         return team_map, dist_map
