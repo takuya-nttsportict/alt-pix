@@ -44,7 +44,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--court", default=None)
     p.add_argument("--out", default="perception_debug.mp4")
     p.add_argument("--conf-person", type=float, default=0.4)
-    p.add_argument("--team-backend", choices=["siglip", "hsv"], default="siglip")
+    p.add_argument("--team-backend", choices=["siglip", "lab", "hsv"], default="siglip")
     p.add_argument("--scene-margin", type=float, default=300.0)
     p.add_argument("--device", default="cuda")
     p.add_argument("--max-frames", type=int, default=600)

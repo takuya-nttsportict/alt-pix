@@ -45,6 +45,8 @@ _TORSO_SIDE = 0.15  # trim left/right margins (arms, background)
 
 _HSV_H_BINS = 12
 _HSV_S_BINS = 4
+_LAB_A_BINS = 16
+_LAB_B_BINS = 16
 
 
 def _torso_crop(frame: np.ndarray, bbox: tuple[float, float, float, float]) -> np.ndarray | None:
@@ -66,12 +68,29 @@ def _torso_crop(frame: np.ndarray, bbox: tuple[float, float, float, float]) -> n
 
 
 def _hsv_embed(crop: np.ndarray) -> np.ndarray:
-    """Normalised hue-saturation histogram of a BGR torso crop (numpy fallback)."""
+    """Normalised hue-saturation histogram of a BGR torso crop."""
     import cv2
 
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
     hist = cv2.calcHist([hsv], [0, 1], None, [_HSV_H_BINS, _HSV_S_BINS],
                         [0, 180, 0, 256])
+    hist = hist.flatten().astype(np.float64)
+    s = hist.sum()
+    return hist / s if s > 0 else hist
+
+
+def _lab_embed(crop: np.ndarray) -> np.ndarray:
+    """Normalised a*b* histogram of a BGR torso crop.
+
+    CIE Lab is perceptually uniform and more stable under illumination changes
+    than HSV. L* (luminance) is dropped to be lighting-invariant; only the
+    chromatic a* (green-red) and b* (blue-yellow) channels are used.
+    """
+    import cv2
+
+    lab = cv2.cvtColor(crop, cv2.COLOR_BGR2Lab)
+    hist = cv2.calcHist([lab], [1, 2], None, [_LAB_A_BINS, _LAB_B_BINS],
+                        [0, 256, 0, 256])
     hist = hist.flatten().astype(np.float64)
     s = hist.sum()
     return hist / s if s > 0 else hist
@@ -118,8 +137,9 @@ class TeamClassifier:
     """Two-team uniform clustering with a warm-up buffer.
 
     Args:
-        backend:    "siglip" (default, needs transformers+torch) or "hsv" (numpy
-                    fallback). On siglip import/load failure it falls back to hsv.
+        backend:    "siglip" (default, needs transformers+torch), "lab" (CIE a*b*
+                    histogram, numpy-only, more illumination-stable than HSV), or
+                    "hsv" (hue-saturation histogram). On siglip failure falls back to lab.
         warmup_frames: collect crops for this many *processed* frames before the
                     first KMeans fit. The buffer keeps accumulating and the model
                     is refit periodically so late-arriving uniforms are captured.
@@ -129,7 +149,7 @@ class TeamClassifier:
 
     def __init__(
         self,
-        backend: Literal["siglip", "hsv"] = "siglip",
+        backend: Literal["siglip", "lab", "hsv"] = "siglip",
         warmup_frames: int = 30,
         refit_every: int = 150,
         device: str = "cuda",
@@ -162,9 +182,9 @@ class TeamClassifier:
             logger.info(f"TeamClassifier: SigLIP backend loaded ({name})")
         except Exception as e:  # noqa: BLE001 — degrade, don't crash the pipeline
             logger.warning(
-                f"TeamClassifier: SigLIP unavailable ({e!r}); falling back to HSV histogram."
+                f"TeamClassifier: SigLIP unavailable ({e!r}); falling back to Lab histogram."
             )
-            self._backend = "hsv"
+            self._backend = "lab"
             self._siglip = None
 
     def _embed(self, crops: Sequence[np.ndarray]) -> np.ndarray:
@@ -172,7 +192,9 @@ class TeamClassifier:
             return np.empty((0, 0))
         if self._backend == "siglip" and self._siglip is not None:
             return self._embed_siglip(crops)
-        return np.stack([_hsv_embed(c) for c in crops])
+        if self._backend == "hsv":
+            return np.stack([_hsv_embed(c) for c in crops])
+        return np.stack([_lab_embed(c) for c in crops])  # "lab" (default fallback)
 
     def _embed_siglip(self, crops: Sequence[np.ndarray]) -> np.ndarray:
         import cv2
@@ -270,18 +292,22 @@ class TeamClassifier:
         emb = self._embed(crops)
 
         # Warm-up: accumulate, fit once enough frames/samples are collected.
+        # Buffer is NOT cleared after the first fit so that periodic refits
+        # always have the full history available (prevents instability from
+        # refitting on a tiny current-frame-only sample).
+        self._buffer.extend(emb)
+        self._buffer = self._buffer[-512:]  # cap memory
         if not self.ready:
-            self._buffer.extend(emb)
             if self._frames_seen >= self._warmup and len(self._buffer) >= 4:
                 self.fit(np.stack(self._buffer))
-                self._buffer.clear()
             return {tid: -1 for tid in ids}, {}
 
         # Periodic refit to absorb uniforms unseen during warm-up.
-        if self._refit_every and self._frames_seen % self._refit_every == 0:
-            self._buffer.extend(emb)
-            self.fit(np.stack(self._buffer[-512:]))  # cap buffer memory
-            self._buffer = self._buffer[-512:]
+        # Guard: require at least 50 samples to avoid noisy small-batch updates.
+        _MIN_REFIT = 50
+        if (self._refit_every and self._frames_seen % self._refit_every == 0
+                and len(self._buffer) >= _MIN_REFIT):
+            self.fit(np.stack(self._buffer))
 
         labels = self.predict(emb)
         dists = self.distance_to_teams(emb)

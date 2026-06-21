@@ -58,7 +58,7 @@ def parse_args() -> argparse.Namespace:
                    help="Optional court JSON; restricts to near-court people")
     p.add_argument("--out", default="team_debug.mp4")
     p.add_argument("--conf-person", type=float, default=0.4)
-    p.add_argument("--team-backend", choices=["siglip", "hsv"], default="siglip")
+    p.add_argument("--team-backend", choices=["siglip", "lab", "hsv"], default="siglip")
     p.add_argument("--warmup", type=int, default=30)
     p.add_argument("--refit", type=int, default=150)
     p.add_argument("--scene-margin", type=float, default=300.0)
