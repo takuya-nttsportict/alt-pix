@@ -49,6 +49,10 @@ class _PartState:
     appear_ema: float | None = None  # EMA of uniform-colour match [0,1] (optional)
     last_foot: tuple[float, float] | None = None
     score: float = 0.0
+    # Grace period: track when person was last on court.
+    frames_since_exit: int = 999    # frames elapsed since leaving the court (999 = never inside)
+    was_on_court: bool = False      # on-court last frame
+    recently_exited: bool = False   # True within grace_frames after leaving court
 
 
 @dataclass
@@ -78,6 +82,7 @@ class ParticipationTracker:
     w_on_court: float = 0.4
     w_motion: float = 0.3
     w_appearance: float = 0.3
+    grace_frames: int = 45  # frames after leaving court to keep recently_exited=True (~1.5s@30fps)
 
     _states: dict[int, _PartState] = field(default_factory=dict)
 
@@ -102,8 +107,19 @@ class ParticipationTracker:
             st.frames += 1
 
             # ── on-court indicator ────────────────────────────────────────────
-            on = 1.0 if self.court.is_on_court(t.bbox, self.on_court_margin) else 0.0
+            on_court_now = self.court.is_on_court(t.bbox, self.on_court_margin)
+            on = 1.0 if on_court_now else 0.0
             st.on_court_ema += self.alpha * (on - st.on_court_ema)
+
+            # ── grace period: recently exited court ───────────────────────────
+            if on_court_now:
+                st.frames_since_exit = 0
+                st.was_on_court = True
+            elif st.was_on_court:
+                # just exited or still off after having been on
+                st.frames_since_exit += 1
+            st.recently_exited = (st.frames_since_exit > 0
+                                  and st.frames_since_exit <= self.grace_frames)
 
             # ── motion (bbox-height-normalised foot displacement) ─────────────
             x1, y1, x2, y2 = t.bbox
@@ -149,5 +165,6 @@ class ParticipationTracker:
             return "no data"
         motion_score = min(1.0, st.motion_ema / max(self.motion_ref, 1e-6))
         ap = f" appear={st.appear_ema:.2f}" if st.appear_ema is not None else ""
+        grace = f" grace={st.frames_since_exit}f" if st.recently_exited else ""
         return (f"score={st.score:.2f} (oncourt={st.on_court_ema:.2f} "
-                f"motion={motion_score:.2f}{ap}, n={st.frames})")
+                f"motion={motion_score:.2f}{ap}{grace}, n={st.frames})")

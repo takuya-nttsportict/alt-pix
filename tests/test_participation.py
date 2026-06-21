@@ -83,6 +83,37 @@ def test_appearance_signal_folds_in():
     assert 0.0 < st.score < 0.5
 
 
+def test_recently_exited_court_flag():
+    """A player who steps off court should have recently_exited=True for grace_frames."""
+    pt = ParticipationTracker(_court(), alpha=0.2, min_frames=10, motion_ref=0.04,
+                              grace_frames=30)
+    # Put player on court for a while.
+    for _ in range(20):
+        pt.update([_track(1, 300, 250)])
+    # Step off court.
+    for f in range(15):
+        states = pt.update([_track(1, 300, 800)])
+    st = states[1]
+    assert st.recently_exited is True
+    assert st.frames_since_exit == 15
+
+    # After grace_frames, recently_exited resets.
+    for _ in range(20):
+        pt.update([_track(1, 300, 800)])
+    st = pt.update([_track(1, 300, 800)])[1]
+    assert st.recently_exited is False
+
+
+def test_never_on_court_not_recently_exited():
+    """A person who was never inside the court has recently_exited=False."""
+    pt = ParticipationTracker(_court(), alpha=0.2, min_frames=10)
+    st = None
+    for _ in range(40):
+        st = pt.update([_track(9, 600, 800)])[9]
+    assert st.recently_exited is False
+    assert st.frames_since_exit == 999
+
+
 def _run_all() -> None:
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

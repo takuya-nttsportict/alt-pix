@@ -140,6 +140,12 @@ class RoleClassifier:
                 reasons[tid] = f"participating -> field [{expl}]"
                 continue
 
+            # Grace period: person recently stepped off court (server / ball-chaser).
+            if st.recently_exited:
+                roles[tid] = "field"
+                reasons[tid] = f"recently exited court ({st.frames_since_exit}f ago) -> field [{expl}]"
+                continue
+
             # Non-participant: split bench (team colour) vs referee (outlier/none).
             d = dist_map.get(tid)
             if team_map.get(tid, -1) >= 0 and d is not None and np.isfinite(d) and thr is not None and d <= thr:
