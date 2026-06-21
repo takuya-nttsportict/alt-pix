@@ -84,6 +84,22 @@ class CourtCalibration:
             result.append(self._point_in_court(foot_x, foot_y, self.player_margin))
         return result
 
+    def foot_distance(self, bbox: tuple) -> float:
+        """Signed distance (px) from the player's foot to the court polygon.
+
+        Positive = inside, negative = outside. Used for on-court vs off-court
+        role classification (field players vs bench/referee on the sideline).
+        """
+        x1, y1, x2, y2 = bbox
+        foot_x = (x1 + x2) / 2
+        foot_y = y2
+        return float(cv2.pointPolygonTest(self._poly, (foot_x, foot_y), measureDist=True))
+
+    def is_on_court(self, bbox: tuple, margin: float | None = None) -> bool:
+        """True if the player's foot is within `margin` px of the court polygon."""
+        m = self.player_margin if margin is None else margin
+        return self.foot_distance(bbox) >= -m
+
     def filter_ball(self, bboxes: list[tuple]) -> list[bool]:
         """Return mask: True = detection is within ball margin of court."""
         result = []
@@ -92,6 +108,41 @@ class CourtCalibration:
             cy = (y1 + y2) / 2
             result.append(self._point_in_court(cx, cy, self.ball_margin))
         return result
+
+    def off_court_zone(self, bbox: tuple, margin_m: float = 0.5) -> str:
+        """Classify a foot's position relative to the court, in court metres.
+
+        Court metres (from the 4 corners [TL,TR,BR,BL]):
+          u in [0,18] = length (END lines at u=0 / u=18 = TL-BL / TR-BR),
+          v in [0,9]  = width  (SIDE lines at v=0 / v=9 = TL-TR / BL-BR).
+
+        Returns:
+          "on"       inside the court (within margin_m of the lines).
+          "endline"  clearly past an END line but BETWEEN the sidelines — the
+                     serving zone behind TL-BL / TR-BR. A person here is very
+                     likely a PLAYER (a server), per the user's spatial prior.
+          "sideline" clearly past a SIDE line but BETWEEN the end lines — above
+                     TL-TR / below BL-BR, where referees / line judges / the
+                     bench stand. A person here is very likely a NON-player.
+          "corner"   past BOTH (the corner region): ambiguous — a line judge may
+                     stand here, so leave the decision to other signals.
+        """
+        x1, y1, x2, y2 = bbox
+        foot_x = (x1 + x2) / 2
+        foot_y = y2
+        try:
+            u, v = self.image_to_court(foot_x, foot_y)
+        except Exception:  # pragma: no cover - degenerate homography
+            return "corner"
+        u_out = u < -margin_m or u > _COURT_W + margin_m
+        v_out = v < -margin_m or v > _COURT_H + margin_m
+        if not u_out and not v_out:
+            return "on"
+        if u_out and not v_out:
+            return "endline"
+        if v_out and not u_out:
+            return "sideline"
+        return "corner"
 
     # ── Coordinate transforms ─────────────────────────────────────────────────
 

@@ -22,19 +22,43 @@ def _color(track_id: int) -> tuple[int, int, int]:
     return _PALETTE[track_id % len(_PALETTE)]
 
 
+# Team / role colours (BGR). Teams get two distinct hues; off-court roles are
+# de-emphasised so the eye stays on the field players (framing-relevant ones).
+_TEAM_COLOR = {0: (0, 200, 255), 1: (255, 128, 0)}   # team 0 = amber, team 1 = blue
+_ROLE_COLOR = {"referee": (0, 255, 255), "bench": (140, 140, 140), "off": (110, 110, 110)}
+
+
+def _track_color(track: Track) -> tuple[int, int, int]:
+    """Colour a track by role first (referee/bench/off), else by team, else id."""
+    if track.role in _ROLE_COLOR:
+        return _ROLE_COLOR[track.role]
+    if track.team in _TEAM_COLOR:
+        return _TEAM_COLOR[track.team]
+    return _color(track.track_id)
+
+
 def draw_tracks(
     frame: np.ndarray,
     tracks: list[Track],
     jersey_map: dict[int, str],
 ) -> None:
-    """Draw player BBoxes, track IDs, and jersey numbers in-place."""
+    """Draw player BBoxes, track IDs, jersey numbers, team and role in-place."""
     for track in tracks:
         x1, y1, x2, y2 = (int(v) for v in track.bbox)
-        color = _color(track.track_id)
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        color = _track_color(track)
+        # Off-court roles drawn thinner to recede visually.
+        thick = 1 if track.role in ("bench", "off") else 2
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, thick)
 
         jersey = jersey_map.get(track.track_id, "?")
-        label = f"#{jersey} [{track.track_id}]"
+        parts = [f"[{track.track_id}]"]
+        if jersey and jersey != "?":
+            parts.insert(0, f"#{jersey}")
+        if track.team is not None and track.team >= 0:
+            parts.append(f"T{track.team}")
+        if track.role and track.role != "field":
+            parts.append(track.role)
+        label = " ".join(parts)
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
         cv2.rectangle(frame, (x1, y1 - th - 6), (x1 + tw + 4, y1), color, -1)
         cv2.putText(

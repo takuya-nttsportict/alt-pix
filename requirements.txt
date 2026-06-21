@@ -15,6 +15,13 @@ onnxruntime-gpu>=1.18.0
 trackers>=2.4.0
 supervision>=0.29.0
 
+# ── Team classification (Phase 4: SigLIP uniform embedding → 2-means) ─────────
+# google/siglip-base-patch16-224 weights are Apache 2.0 (commercial OK). The
+# classifier degrades to a numpy HSV-histogram backend if transformers is absent,
+# so this is a soft dependency. KMeans is implemented in-house (numpy) — no
+# scikit-learn needed.
+transformers>=4.44.0
+
 # ── OCR ───────────────────────────────────────────────────────────────────────
 easyocr>=1.7.0
 
