@@ -261,7 +261,11 @@ def main() -> None:
                 jersey_map = ocr.update(frame, tracks)
 
             # ── Framing ───────────────────────────────────────────────────────
-            roi = framing.compute(ball_state, field_tracks)
+            # During timeouts / set breaks the on-court count collapses; the
+            # participation tracker flags this as game_active=False, and framing
+            # holds a wide shot instead of chasing the ball / people walking off.
+            game_active = role_clf.participation.game_active if role_clf is not None else True
+            roi = framing.compute(ball_state, field_tracks, game_active=game_active)
 
             # ── Output ────────────────────────────────────────────────────────
             record = _make_record(frame_id, ts * 1000, ball_state, tracks, jersey_map, roi)
@@ -293,7 +297,9 @@ def main() -> None:
                 f"tracks={len(tracks):2d} field={n_field:2d} ref={n_ref:1d} "
                 f"team_ready={'Y' if (assigner and assigner.ready) else 'N'} "
                 f"ball={'Y' if ball_state.visible else 'N'} "
-                f"ball_conf={ball_state.conf:.2f}"
+                f"ball_conf={ball_state.conf:.2f} "
+                f"game={'PLAY' if game_active else 'PAUSE'} "
+                f"roi=({roi.x},{roi.y},{roi.w},{roi.h})"
             )
 
             # ── Per-interval summary (INFO) ────────────────────────────────────

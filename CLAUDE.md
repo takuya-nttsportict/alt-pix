@@ -76,6 +76,7 @@ Claude は本プロジェクトで作業する際、**必ず**この原則に従
 - **ドキュメント一覧（`docs/`）**:
   - `docs/phase3_ball_detection.md` — Phase 3 技術選定・評価結果・失敗モード・Phase 3.5 計画
   - `docs/phase4_player_perception.md` — Phase 4 技術選定・実装詳細・他スポーツ展開方針
+  - `docs/phase5_framing.md` — Phase 5 フレーミング設計・候補比較・評価指標・他競技展開
 
 ---
 
@@ -100,10 +101,10 @@ Claude は本プロジェクトで作業する際、**必ず**この原則に従
 |---|---|---|---|
 | **Phase 1** | 基盤（ストリーム受信・人物検出・初期トラッキング） | マージ済み | — |
 | **Phase 2** | ボール検出・コートキャリブレーション・ロギング整備 | マージ済み | — |
-| **Phase 3** | ボール検出精度の改善（TrackNetV2/WASB-SBDT） | 評価完了・PR 中 | `docs/phase3_ball_detection.md` |
+| **Phase 3** | ボール検出精度の改善（TrackNetV2/WASB-SBDT） | マージ済み | `docs/phase3_ball_detection.md` |
 | **Phase 3.5** | サーブ起点・低速ボール対策 | Phase 5 後に実データ測定してから対策選定 | `docs/phase3_ball_detection.md` |
-| **Phase 4（再定義）** | コート上選手の知覚（人物 MOT＋チーム分類＋役割フィルタ）。フレーミング・分析の共通知覚コア | 実装済み・PR 準備中 | `docs/phase4_player_perception.md` |
-| **Phase 5** | フレーミング統合（ボール＋選手集団から ROI 算出・カメラ追従） | 次着手 | — |
+| **Phase 4（再定義）** | コート上選手の知覚（人物 MOT＋チーム分類＋役割フィルタ）。フレーミング・分析の共通知覚コア | マージ済み | `docs/phase4_player_perception.md` |
+| **Phase 5** | フレーミング統合（ボール＋選手集団から ROI 算出・カメラ追従）。ROI 座標出力（クロップ描画は 5.x） | 実装中 | `docs/phase5_framing.md` |
 | **Phase 6** | 試合分析（tracklet 単位の背番号 OCR・個人 trajectory・スタッツ）。OCR 保留を解除 | — | — |
 
 ---
