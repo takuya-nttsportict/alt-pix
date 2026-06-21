@@ -41,6 +41,7 @@ from alt_pix.log_config import setup_logging
 from alt_pix.output import JSONLWriter, VideoWriter, _make_record
 from alt_pix.roles import RoleClassifier
 from alt_pix.stream import iter_frames
+from alt_pix.team_assign import make_team_assigner
 from alt_pix.team_classifier import TeamClassifier
 from alt_pix.tracknet import TrackNetDetector
 from alt_pix.tracker import PlayerTracker
@@ -72,10 +73,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--track-buffer",  type=int,   default=30)
 
     # Perception core (Phase 4): team classification + role filtering
+    p.add_argument("--sport", choices=["volleyball", "basketball", "generic"],
+                   default="volleyball",
+                   help="Team-assignment strategy by sport: volleyball uses the "
+                        "court-half (net) boundary; others use uniform colour clustering")
     p.add_argument("--no-team", action="store_true",
-                   help="Disable team (uniform) classification")
-    p.add_argument("--team-backend", choices=["siglip", "hsv"], default="siglip",
-                   help="Uniform embedding backend (siglip falls back to hsv if unavailable)")
+                   help="Disable team assignment")
+    p.add_argument("--team-backend", choices=["siglip", "lab", "hsv"], default="siglip",
+                   help="Uniform embedding backend for colour clustering "
+                        "(siglip falls back to lab if unavailable)")
     p.add_argument("--no-role", action="store_true",
                    help="Disable role classification (field/bench/referee). "
                         "Requires --court.")
@@ -159,11 +165,14 @@ def main() -> None:
             "All detections will be used without spatial filtering."
         )
 
-    # ── Team classification + role filtering (Phase 4 perception core) ─────────
-    team_clf: TeamClassifier | None = None
+    # ── Team assignment + role filtering (Phase 4 perception core) ─────────────
+    # Team-assignment strategy depends on the sport (principle 4): net sports
+    # split deterministically by court half; invasion sports by uniform colour.
+    assigner = None
     if not args.no_team:
-        logger.info(f"Initialising team classifier (backend={args.team_backend}) …")
         team_clf = TeamClassifier(backend=args.team_backend, device=args.device)
+        assigner = make_team_assigner(args.sport, court, team_clf)
+        logger.info(f"Team assigner: {assigner.method} (sport={args.sport})")
 
     role_clf: RoleClassifier | None = None
     if not args.no_role:
@@ -227,19 +236,22 @@ def main() -> None:
             tracks    = tracker.update(person_dets, frame)
             ball_state = ball_tracker.update(ball_dets)
 
-            # ── Team classification + role labelling (perception core) ─────────
+            # ── Team assignment + role labelling (perception core) ─────────────
             dist_map: dict[int, float] = {}
-            if team_clf is not None:
-                team_map, dist_map = team_clf.update(frame, tracks)
+            if assigner is not None:
+                result = assigner.update(frame, tracks)
+                dist_map = result.dist_map
                 for t in tracks:
-                    tm = team_map.get(t.track_id, -1)
+                    tm = result.team_map.get(t.track_id, -1)
                     t.team = tm if tm >= 0 else None
+                    t.team_reason = result.reason_map.get(t.track_id)
             if role_clf is not None:
                 team_map_safe = {t.track_id: (t.team if t.team is not None else -1)
                                  for t in tracks}
                 role_map = role_clf.classify(tracks, team_map_safe, dist_map)
                 for t in tracks:
                     t.role = role_map.get(t.track_id)
+                    t.role_reason = role_clf.last_reasons.get(t.track_id)
 
             # Field players (framing-relevant). Without role info, treat all as field.
             field_tracks = [t for t in tracks if t.role in (None, "field")]
@@ -279,7 +291,7 @@ def main() -> None:
                 f"frame={frame_id:5d} ts={ts:7.2f}s "
                 f"persons={len(person_dets):2d} "
                 f"tracks={len(tracks):2d} field={n_field:2d} ref={n_ref:1d} "
-                f"team_ready={'Y' if (team_clf and team_clf.ready) else 'N'} "
+                f"team_ready={'Y' if (assigner and assigner.ready) else 'N'} "
                 f"ball={'Y' if ball_state.visible else 'N'} "
                 f"ball_conf={ball_state.conf:.2f}"
             )

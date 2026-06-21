@@ -38,7 +38,9 @@ def _make_record(
                 "track_id": t.track_id,
                 "jersey": jersey_map.get(t.track_id),
                 "team": t.team,
+                "team_reason": t.team_reason,
                 "role": t.role,
+                "role_reason": t.role_reason,
                 "bbox": [round(v, 1) for v in t.bbox],
                 "conf": round(t.conf, 3),
             }

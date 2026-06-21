@@ -32,6 +32,7 @@ from alt_pix.detector import YOLOXDetector, _COCO_PERSON
 from alt_pix.log_config import setup_logging
 from alt_pix.roles import RoleClassifier
 from alt_pix.stream import iter_frames
+from alt_pix.team_assign import make_team_assigner
 from alt_pix.team_classifier import TeamClassifier
 from alt_pix.tracker import PlayerTracker
 from alt_pix.visualizer import draw_tracks
@@ -44,6 +45,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--court", default=None)
     p.add_argument("--out", default="perception_debug.mp4")
     p.add_argument("--conf-person", type=float, default=0.4)
+    p.add_argument("--sport", choices=["volleyball", "basketball", "generic"],
+                   default="volleyball",
+                   help="volleyball=court-half(net); others=colour clustering")
     p.add_argument("--team-backend", choices=["siglip", "lab", "hsv"], default="siglip")
     p.add_argument("--scene-margin", type=float, default=300.0)
     p.add_argument("--device", default="cuda")
@@ -61,9 +65,11 @@ def main() -> None:
     person_det = YOLOXDetector(args.person_model, conf_thr=args.conf_person,
                                detect_classes={_COCO_PERSON}, device=ort_device)
     tracker = PlayerTracker()
-    team_clf = TeamClassifier(backend=args.team_backend, device=args.device)
     court = CourtCalibration.load(args.court) if args.court else None
+    team_clf = TeamClassifier(backend=args.team_backend, device=args.device)
+    assigner = make_team_assigner(args.sport, court, team_clf)
     role_clf = RoleClassifier(court) if court is not None else None
+    print(f"── チーム割当方式: {assigner.method}  (sport={args.sport}) ──")
 
     writer: cv2.VideoWriter | None = None
     n = 0
@@ -75,15 +81,17 @@ def main() -> None:
 
         tracks = tracker.update(person_dets, frame)
 
-        team_map, dist_map = team_clf.update(frame, tracks)
+        result = assigner.update(frame, tracks)
         for t in tracks:
-            tm = team_map.get(t.track_id, -1)
+            tm = result.team_map.get(t.track_id, -1)
             t.team = tm if tm >= 0 else None
+            t.team_reason = result.reason_map.get(t.track_id)
         if role_clf is not None:
             safe = {t.track_id: (t.team if t.team is not None else -1) for t in tracks}
-            role_map = role_clf.classify(tracks, safe, dist_map)
+            role_map = role_clf.classify(tracks, safe, result.dist_map)
             for t in tracks:
                 t.role = role_map.get(t.track_id)
+                t.role_reason = role_clf.last_reasons.get(t.track_id)
 
         vis = frame.copy()
         draw_tracks(vis, tracks, {})

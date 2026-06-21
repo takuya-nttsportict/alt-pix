@@ -43,6 +43,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from alt_pix.detector import YOLOXDetector, _COCO_PERSON
 from alt_pix.log_config import setup_logging
 from alt_pix.stream import iter_frames
+from alt_pix.team_assign import make_team_assigner
 from alt_pix.team_classifier import TeamClassifier
 from alt_pix.team_eval import TeamStats
 from alt_pix.tracker import PlayerTracker
@@ -58,6 +59,9 @@ def parse_args() -> argparse.Namespace:
                    help="Optional court JSON; restricts to near-court people")
     p.add_argument("--out", default="team_debug.mp4")
     p.add_argument("--conf-person", type=float, default=0.4)
+    p.add_argument("--sport", choices=["volleyball", "basketball", "generic"],
+                   default="volleyball",
+                   help="volleyball=court-half(net); others=colour clustering")
     p.add_argument("--team-backend", choices=["siglip", "lab", "hsv"], default="siglip")
     p.add_argument("--warmup", type=int, default=30)
     p.add_argument("--refit", type=int, default=150)
@@ -78,13 +82,17 @@ def main() -> None:
     person_det = YOLOXDetector(args.person_model, conf_thr=args.conf_person,
                                detect_classes={_COCO_PERSON}, device=ort_device)
     tracker = PlayerTracker()
-    team_clf = TeamClassifier(backend=args.team_backend, warmup_frames=args.warmup,
-                              refit_every=args.refit, device=args.device)
 
     court = None
     if args.court:
         from alt_pix.court import CourtCalibration
         court = CourtCalibration.load(args.court)
+
+    # 色クラスタは volleyball 以外（または court 無し）でのみ実際に使われる。
+    team_clf = TeamClassifier(backend=args.team_backend, warmup_frames=args.warmup,
+                              refit_every=args.refit, device=args.device)
+    assigner = make_team_assigner(args.sport, court, team_clf)
+    print(f"── チーム割当方式: {assigner.method}  (sport={args.sport}) ──")
 
     stats = TeamStats()
     writer: cv2.VideoWriter | None = None
@@ -97,8 +105,10 @@ def main() -> None:
                            if court.is_on_court(d.bbox, args.scene_margin)]
 
         tracks = tracker.update(person_dets, frame)
-        team_map, _dist_map = team_clf.update(frame, tracks)
-        margin_map = team_clf.last_margins
+        result = assigner.update(frame, tracks)
+        team_map = result.team_map
+        margin_map = result.margin_map
+        reason_map = result.reason_map
         stats.update(team_map, margin_map)
 
         vis = frame.copy()
@@ -123,11 +133,16 @@ def main() -> None:
             cv2.rectangle(vis, (x1, y1 - th - 6), (x1 + tw + 4, y1), color, -1)
             cv2.putText(vis, label, (x1 + 2, y1 - 4),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+            # 判定理由を bbox 下に小さく表示（説明可能性）。
+            reason = reason_map.get(t.track_id, "")
+            if reason:
+                cv2.putText(vis, reason, (x1 + 2, y2 + 12),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.36, color, 1, cv2.LINE_AA)
 
         cv2.putText(vis,
-                    f"f={frame_id} tracks={len(tracks)} t0={n0} t1={n1} "
-                    f"ready={team_clf.ready}",
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+                    f"f={frame_id} {assigner.method} tracks={len(tracks)} "
+                    f"t0={n0} t1={n1} ready={assigner.ready}",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
         if writer is None:
             h, w = vis.shape[:2]
@@ -138,7 +153,7 @@ def main() -> None:
         n += 1
         if n % 100 == 0:
             s = stats.summary()
-            print(f"[f={frame_id:5d}] t0={n0:2d} t1={n1:2d} ready={team_clf.ready} "
+            print(f"[f={frame_id:5d}] t0={n0:2d} t1={n1:2d} ready={assigner.ready} "
                   f"purity_w={s['purity_weighted']:.3f} "
                   f"flip/100={s['flip_rate_per100']:.2f}")
         if args.max_frames and n >= args.max_frames:

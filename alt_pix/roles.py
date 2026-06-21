@@ -56,6 +56,12 @@ class RoleClassifier:
         self._court = court
         self._field_margin = field_margin
         self._thresh_ema: float | None = None
+        self._last_reasons: dict[int, str] = {}
+
+    @property
+    def last_reasons(self) -> dict[int, str]:
+        """{track_id: human-readable reason} from the most recent classify()."""
+        return self._last_reasons
 
     def _update_threshold(self, field_dists: list[float]) -> float | None:
         """Robust outlier threshold from the colour-distance of on-court players.
@@ -97,17 +103,30 @@ class RoleClassifier:
         thr = self._update_threshold(field_dists)
 
         roles: dict[int, Role] = {}
+        reasons: dict[int, str] = {}
         for t in tracks:
             tid = t.track_id
+            fd = self._court.foot_distance(t.bbox)
             if on_court[tid]:
                 roles[tid] = "field"
+                reasons[tid] = f"on-court (foot {fd:+.0f}px >= -{self._field_margin:.0f}) -> field"
                 continue
             # Off-court: split bench vs referee by colour outlier when possible.
             d = dist_map.get(tid)
             if team_map.get(tid, -1) < 0 or d is None or not np.isfinite(d) or thr is None:
                 roles[tid] = "off"
+                reasons[tid] = f"off-court (foot {fd:+.0f}px); no colour signal -> off"
             elif d > thr:
                 roles[tid] = "referee"
+                reasons[tid] = (
+                    f"off-court (foot {fd:+.0f}px) + colour outlier "
+                    f"(d={d:.3f} > thr={thr:.3f}) -> referee"
+                )
             else:
                 roles[tid] = "bench"
+                reasons[tid] = (
+                    f"off-court (foot {fd:+.0f}px) + team colour "
+                    f"(d={d:.3f} <= thr={thr:.3f}) -> bench"
+                )
+        self._last_reasons = reasons
         return roles

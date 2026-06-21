@@ -262,6 +262,11 @@ class TeamClassifier:
         return self._last_margins
 
     @property
+    def backend(self) -> str:
+        """Active embedding backend ("siglip" / "lab" / "hsv")."""
+        return self._backend
+
+    @property
     def ready(self) -> bool:
         return self._centroids is not None
 

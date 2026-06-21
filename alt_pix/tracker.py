@@ -27,6 +27,8 @@ class Track:
     jersey_number: str | None = None
     team: int | None = None      # 0/1 from TeamClassifier, None until ready
     role: str | None = None      # "field" / "bench" / "referee" / "off" (Phase 4)
+    team_reason: str | None = None  # why this team was assigned (explainability)
+    role_reason: str | None = None  # why this role was assigned (explainability)
 
 
 def _dets_to_sv(detections: list[Detection]):
