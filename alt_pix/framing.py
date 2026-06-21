@@ -1,48 +1,48 @@
-"""Virtual camera framing: compute a smooth crop ROI from ball + players.
+"""Virtual camera framing: state-aware ROI with critically-damped smoothing.
 
-Phase 5 — フレーミング統合（放送的＝滑らかさ優先）。
+Phase 5（再設計, 2026-06）— 放送カメラワークのセオリー調査を反映。
+参考: Ariki 2006（状況認識でカメラワーク切替）, OHMM（軌跡平滑化）,
+Unity SmoothDamp / Game Programming Gems 4（臨界制動スプリング）, 放送現場の
+リードルーム／速度制限の慣行。
 
-設計の狙い（旧実装の課題と対策）:
-  旧 framing は「ボール可視ならボール中心、不可視なら全選手 wide」という
-  ハード切替だった。ボールが一瞬でも検出落ちするたびに wide ↔ ball を往復し、
-  カメラがガクガク跳ぶ。Phase 5 では以下で放送的な滑らかさを得る。
+旧実装（速度制限つき EMA）の致命的問題:
+  EMA は 1 次フィルタで「速度」を状態に持たない。目標が動き続けると EMA は
+  遅れて追従し、目標が止まると慣性でオーバーシュート。さらに速度上限クランプに
+  当たるとカクつく。実映像評価で「カクカクして左右に揺れる」と NG。
 
-  1. **加重合成（ハード切替の廃止）**: ターゲット中心は
-        center = w_ball · ball + (1 - w_ball) · players_centroid
-     とし、ボールの確度で w_ball を連続的に変える。
-       - visible（検出）        → w_ball 高（ボール主体）
-       - predicted（Kalman 補間）→ w_ball 中（選手集団へ寄せ始める）
-       - lost                  → w_ball = 0（選手集団のみ）
-     ボールが瞬断しても重みが滑らかに移るだけで、画は跳ばない。
+本実装の核心:
 
-  2. **pan と zoom の分離**: 中心移動（pan）とサイズ変化（zoom）を別 EMA・別
-     速度制限で平滑化する。速い pan と緩い zoom を独立に調律でき、ズームの
-     ハンチング（伸縮の往復）を抑える。
+  1. **臨界制動スプリング（SmoothDamp）で平滑化**:
+     カメラ中心（pan）とサイズ（zoom）を、速度を状態に持つ 2 次フィルタで追従。
+     オーバーシュートせず最短で収束し、ease-in/ease-out が自然。1 パラメータ
+     `smooth_time`（秒）で「気持ちよい追従速度」を決める。pan より zoom を
+     ゆっくりにしてズームのハンチングを抑える。
 
-  3. **デッドゾーン**: ターゲット中心が現フレーム中心の一定範囲内なら pan を
-     凍結する。微小なボール揺れにカメラが反応するジッターを断つ。
+  2. **ゲーム状態でカメラ挙動を切替**（game_state.py が供給）:
+       RALLY    → 選手集団アンカー＋ボール補正の中ズーム追従。
+       SERVICE  → サーバー＋レシーブ隊形が入る wide にゆっくり引く。
+       NO_PLAY  → パンを凍結し wide で保持（出入りを追わない）。
 
-  4. **先読み（look-ahead）**: ボール速度ベクトルで中心を進行方向へ少し進める。
-     高速移動でカメラが後追いになるのを補正する（滑らかさ優先なので控えめ）。
+  3. **リードルーム**: ボール進行方向（主に水平）へ中心を少しオフセット。
+     放送の定石「動く先に空間を空ける」。バレーは pan 優先なので水平主体。
 
-  5. **ゲーム状態ゲーティング**: participation.game_active=False（タイムアウト／
-     セット間で court 上の人数が激減）なら、ボールを追わず wide に緩く保持する。
-     試合が止まっている間、選手の出入りにカメラが振り回されない。
+  4. **ズームイン演出のフック（プレースホルダ）**: スパイク/決定機での寄りは
+     action recognition（Phase 6）が要る。現時点では `highlight` 引数で
+     寄り→保持→戻しのエンベロープだけ実装し、トリガ信号が来たら効くようにする。
 
-出力はクロップ座標 ROI のみ（レンダリングはしない）。アスペクト比維持・フレーム
-内クランプ・最小ズーム保証は従来どおり。
-
-平滑化は速度制限つき EMA。低 alpha ほど滑らかだが追従が遅い（プリンシパル7:
-挙動を観測できるよう、内部状態は debug_framing で可視化できる）。
+出力は ROI 座標のみ（クロップ描画は 5.x）。アスペクト比 16:9 は厳密維持
+（横長素材でフレームごとに歪まないよう、境界クランプ後に必ず再適用）。
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import numpy as np
 
 from .ball_tracker import BallState
+from .game_state import GameState
 from .tracker import Track
 
 
@@ -54,46 +54,76 @@ class ROI:
     h: int  # height
 
 
-# ── 平滑化プロファイル（放送的＝滑らかさ優先のデフォルト） ─────────────────────────
-# NG 評価 (2026-06) で判明した問題と調律:
-#   - ボール左右追従でカメラがスウェーする: _W_BALL_VISIBLE を下げ、
-#     選手集団重心をアンカーとして利かせる。
-#   - pan 速度が速すぎる（カクつく）: _PAN_ALPHA と _MAX_PAN_FRAC を大幅に下げる。
-#   放送的には「選手集団がほぼ中心に収まり、ボールが消えても画が揺れない」を優先。
-_PAN_ALPHA = 0.06          # 中心 EMA 係数（下げて追従を遅く、揺れを抑制）
-_ZOOM_ALPHA = 0.04         # サイズ EMA 係数（pan より緩く＝ズーム往復を抑制）
-_MAX_PAN_FRAC = 0.015      # 1 フレームの中心移動上限（フレーム幅比; 0.04→0.015 に削減）
-_MAX_ZOOM_RATE = 0.02      # 1 フレームのサイズ変化上限（現サイズ比）
-_DEADZONE_FRAC = 0.04      # この範囲内のターゲット中心移動は無視（0.03→0.04 に拡大）
-_LOOKAHEAD_FRAMES = 1.5    # ボール速度の先読み（控えめ方向にさらに削減）
-_LOOKAHEAD_MAX_FRAC = 0.08  # 先読み量の上限（フレーム幅比）
+# ── 平滑化（臨界制動スプリング）の時定数 [秒] ─────────────────────────────────────
+# smooth_time が大きいほど滑らか（遅い）。放送的: pan はやや機敏、zoom は緩慢。
+_PAN_SMOOTH_TIME = 0.9      # 中心追従の時定数
+_ZOOM_SMOOTH_TIME = 1.6     # サイズ追従の時定数（pan より緩く）
+_MAX_PAN_SPEED_FRAC = 0.6   # pan の最大速度（フレーム幅/秒）。急な飛びを抑える上限
 
-# ボール確度ごとの合成重み（加重合成の肝）。
-# NG 評価でボール追従強すぎ判明 → _W_BALL_VISIBLE を 0.75→0.45 に下げる。
-# 選手集団重心をアンカーにし、ボール位置は補正程度に留める（放送的挙動）。
-_W_BALL_VISIBLE = 0.45     # 検出フレーム: ボールは補正役（選手集団重心が主）
-_W_BALL_PREDICTED = 0.25   # Kalman 補間: さらに選手集団に寄せる
-_W_BALL_LOST = 0.0         # 喪失: 選手集団のみ
+# ── リードルーム ────────────────────────────────────────────────────────────────
+_LEAD_GAIN = 0.18           # ボール速度 [px/frame] に対する先行量の係数
+_LEAD_MAX_FRAC = 0.12       # 先行オフセットの上限（フレーム幅比）
 
-# ROI サイズの制約（フレームに対する割合）。
-_BALL_MARGIN = 0.30        # ボール周辺マージン（フレームサイズ比）
-_WIDE_MARGIN = 0.12        # 選手 BBox 包含へのパディング（包含サイズ比）
-_MIN_ROI_FRAC = 0.30       # ROI 下限（寄り過ぎ防止）
-_MAX_ROI_FRAC = 1.00       # ROI 上限（フレーム全体まで）
-_PAUSE_ROI_FRAC = 0.85     # ゲーム停止時に保持する wide サイズ
+# ── ボール確度ごとの合成重み（RALLY）─────────────────────────────────────────────
+# 選手集団重心をアンカーにし、ボールは補正役（左右スウェー回避）。
+_W_BALL_VISIBLE = 0.45
+_W_BALL_PREDICTED = 0.25
+_W_BALL_LOST = 0.0
+
+# ── ROI サイズの制約（フレーム高に対する割合の zoom レベル）──────────────────────
+# 「zoom レベル」は ROI 高 / フレーム高（1.0=フル）。状態ごとの目標 zoom を定義。
+_ZOOM_RALLY = 0.72          # ラリー通常: 中ズーム（全コートが概ね見える）
+_ZOOM_SERVICE = 0.92        # サーブ: 引いてサーバー＋隊形を収める
+_ZOOM_NO_PLAY = 0.98        # デッドボール: ほぼフル wide
+_ZOOM_HIGHLIGHT = 0.50      # ズームイン演出時（スパイク等、Phase 6 で発火）
+_MIN_ZOOM = 0.35            # 寄りすぎ下限
+_MAX_ZOOM = 1.00
+
+_WIDE_MARGIN = 0.12         # 選手包含 BBox へのパディング（包含サイズ比）
+# ハイライト・エンベロープの増減速度（1 フレームあたりの zoom 係数変化）。
+_HIGHLIGHT_RATE = 0.04
+
+
+def _smooth_damp(
+    current: np.ndarray, target: np.ndarray, vel: np.ndarray,
+    smooth_time: float, dt: float, max_speed: float | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """臨界制動スプリング（Unity SmoothDamp 準拠）。ベクトル対応。
+
+    速度 `vel` を状態として持ち、オーバーシュートせず target へ収束する。
+    EMA と違い目標が止まれば速度も減衰して滑らかに停止する。
+    Returns (new_position, new_velocity)。
+    """
+    omega = 2.0 / max(smooth_time, 1e-4)
+    x = omega * dt
+    exp = 1.0 / (1.0 + x + 0.48 * x * x + 0.235 * x * x * x)
+    change = current - target
+    orig_target = target.copy()
+    # 最大速度クランプ（ベクトルの大きさで制限）。
+    if max_speed is not None:
+        max_change = max_speed * smooth_time
+        mag = float(np.linalg.norm(change))
+        if mag > max_change and mag > 1e-9:
+            change = change / mag * max_change
+    shifted_target = current - change
+    temp = (vel + omega * change) * dt
+    new_vel = (vel - omega * temp) * exp
+    out = shifted_target + (change + temp) * exp
+    # オーバーシュート防止（符号反転したら target にスナップ）。
+    over = (orig_target - current) * (out - orig_target) > 0
+    out = np.where(over, orig_target, out)
+    new_vel = np.where(over, (out - orig_target) / dt, new_vel)
+    return out, new_vel
 
 
 class FramingCalculator:
-    """フレームごとの仮想カメラ ROI を算出する（滑らか平滑化つき）。
+    """状態認識つき仮想カメラ ROI を算出する（臨界制動スプリング平滑化）。
 
     Args:
-        frame_w: 入力フレーム幅 [px]。
-        frame_h: 入力フレーム高 [px]。
+        frame_w, frame_h: 入力フレーム寸法 [px]。
         output_aspect: 出力アスペクト比（w/h）。既定 16:9。
-        mode: 'auto'（ボール＋選手の加重合成）／'ball'（ボール主体）／
-              'wide'（選手包含主体）。'auto' が Phase 5 の本命。
-
-    平滑化パラメータはコンストラクタ引数で上書き可能（評価・他競技調律のため）。
+        fps: 入力フレームレート（スプリングの dt 計算に使用）。
+        pan_smooth_time / zoom_smooth_time: 平滑化時定数 [秒]（大きいほど滑らか）。
     """
 
     def __init__(
@@ -102,34 +132,33 @@ class FramingCalculator:
         frame_h: int,
         output_aspect: float = 16 / 9,
         mode: str = "auto",
-        pan_alpha: float = _PAN_ALPHA,
-        zoom_alpha: float = _ZOOM_ALPHA,
-        max_pan_frac: float = _MAX_PAN_FRAC,
-        max_zoom_rate: float = _MAX_ZOOM_RATE,
-        deadzone_frac: float = _DEADZONE_FRAC,
-        lookahead_frames: float = _LOOKAHEAD_FRAMES,
+        fps: float = 30.0,
+        pan_smooth_time: float = _PAN_SMOOTH_TIME,
+        zoom_smooth_time: float = _ZOOM_SMOOTH_TIME,
+        max_pan_speed_frac: float = _MAX_PAN_SPEED_FRAC,
     ) -> None:
         self._fw = frame_w
         self._fh = frame_h
         self._aspect = output_aspect
-        self._mode = mode
-        self._pan_alpha = pan_alpha
-        self._zoom_alpha = zoom_alpha
-        self._max_pan = max_pan_frac * frame_w
-        self._max_zoom_rate = max_zoom_rate
-        self._deadzone = deadzone_frac * frame_w
-        self._lookahead_frames = lookahead_frames
+        self._mode = mode  # 'auto'（状態認識）/'ball'/'wide'（手動上書き）
+        self._dt = 1.0 / max(fps, 1e-3)
+        self._pan_t = pan_smooth_time
+        self._zoom_t = zoom_smooth_time
+        self._max_pan_speed = max_pan_speed_frac * frame_w
 
-        # 平滑化状態: center [cx, cy] と size [w, h] を分離して保持。
+        # スプリング状態（位置＋速度）。
         self._center: np.ndarray | None = None
+        self._center_vel = np.zeros(2)
         self._size: np.ndarray | None = None
-        # ボール先読み用に直近の可視ボール位置を保持。
+        self._size_vel = np.zeros(2)
+        # リードルーム用の直近可視ボール位置。
         self._ball_prev: np.ndarray | None = None
+        # ハイライト（ズームイン演出）エンベロープ 0..1。
+        self._highlight_env = 0.0
 
-    # ── ターゲット（生の目標 ROI）算出 ───────────────────────────────────────────
+    # ── 部品 ───────────────────────────────────────────────────────────────────
 
     def _players_box(self, tracks: list[Track]) -> tuple[float, float, float, float] | None:
-        """field 選手の包含 BBox（cx, cy, w, h）。選手が居なければ None。"""
         if not tracks:
             return None
         x1s = [t.bbox[0] for t in tracks]
@@ -143,15 +172,12 @@ class FramingCalculator:
                 (bx2 - bx1) + pw * 2, (by2 - by1) + ph * 2)
 
     def _ball_weight(self, ball: BallState) -> float:
-        """ボール確度 → 合成重み w_ball。"""
         if not ball.visible:
             return _W_BALL_LOST
-        if ball.predicted:
-            return _W_BALL_PREDICTED
-        return _W_BALL_VISIBLE
+        return _W_BALL_PREDICTED if ball.predicted else _W_BALL_VISIBLE
 
-    def _ball_lookahead(self, ball: BallState) -> np.ndarray:
-        """直近 2 フレームの可視ボール速度から先読みオフセットを返す。"""
+    def _lead_room(self, ball: BallState) -> np.ndarray:
+        """ボール進行方向（水平主体）への先行オフセット。"""
         if not ball.visible or ball.predicted:
             self._ball_prev = None
             return np.zeros(2)
@@ -161,108 +187,87 @@ class FramingCalculator:
             return np.zeros(2)
         vel = cur - self._ball_prev
         self._ball_prev = cur
-        lead = vel * self._lookahead_frames
-        cap = _LOOKAHEAD_MAX_FRAC * self._fw
+        # バレーは pan 優先 → 水平を主に、垂直は控えめ（×0.3）。
+        lead = np.array([vel[0], vel[1] * 0.3]) * _LEAD_GAIN
+        cap = _LEAD_MAX_FRAC * self._fw
         n = float(np.linalg.norm(lead))
         if n > cap:
             lead = lead / n * cap
         return lead
 
+    def _zoom_level(self, game_state: GameState, highlight: bool) -> float:
+        """状態 → 目標 zoom レベル（ROI 高 / フレーム高）。ハイライトで寄る。"""
+        base = {
+            "rally": _ZOOM_RALLY,
+            "service": _ZOOM_SERVICE,
+            "no_play": _ZOOM_NO_PLAY,
+        }.get(game_state, _ZOOM_RALLY)
+        # ハイライト・エンベロープを更新（寄り→保持→戻しの滑らかな係数）。
+        tgt = 1.0 if highlight else 0.0
+        if self._highlight_env < tgt:
+            self._highlight_env = min(tgt, self._highlight_env + _HIGHLIGHT_RATE)
+        else:
+            self._highlight_env = max(tgt, self._highlight_env - _HIGHLIGHT_RATE)
+        # エンベロープで base と highlight zoom を補間。
+        z = base + (_ZOOM_HIGHLIGHT - base) * self._highlight_env
+        return float(np.clip(z, _MIN_ZOOM, _MAX_ZOOM))
+
     def _target(
-        self, ball: BallState, tracks: list[Track], game_active: bool
-    ) -> tuple[float, float, float, float]:
-        """このフレームの生ターゲット ROI（cx, cy, w, h）。平滑化前。"""
+        self, ball: BallState, tracks: list[Track], game_state: GameState, highlight: bool,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """生ターゲット（center[2], size[2]）。スプリング前。"""
         players = self._players_box(tracks)
+        zoom = self._zoom_level(game_state, highlight)
+        size_h = zoom * self._fh
+        size_w = size_h * self._aspect
+        size = np.array([size_w, size_h], dtype=np.float64)
 
-        # ── ゲーム停止: ボールを追わず選手集団を wide に保持 ──────────────────────
-        if not game_active:
+        # 中心は手動モードを尊重しつつ、状態で重み付け。
+        if self._mode == "wide":
             if players is not None:
-                pcx, pcy, _, _ = players
+                cx, cy, _, _ = players
             else:
-                pcx, pcy = self._fw / 2, self._fh / 2
-            return pcx, pcy, self._fw * _PAUSE_ROI_FRAC, self._fh * _PAUSE_ROI_FRAC
+                cx, cy = self._fw / 2, self._fh / 2
+            return np.array([cx, cy]), size
 
-        w_ball = self._ball_weight(ball)
-        ball_xy = (np.array([ball.x, ball.y], dtype=np.float64) + self._ball_lookahead(ball)
-                   if ball.visible else None)
-
-        # ── モード別の中心とサイズ ──────────────────────────────────────────────
-        if self._mode == "ball" and ball_xy is not None:
-            cx, cy = ball_xy
-            return cx, cy, self._fw * _BALL_MARGIN * 2, self._fh * _BALL_MARGIN * 2
-
-        if self._mode == "wide" or (players is None and ball_xy is None):
+        if game_state == "no_play":
+            # パン凍結: 既存中心を維持（出入りを追わない）。初期は選手 or 画面中央。
+            if self._center is not None:
+                return self._center.copy(), size
             if players is not None:
-                return players
-            return self._fw / 2, self._fh / 2, self._fw * 0.8, self._fh * 0.8
+                return np.array([players[0], players[1]]), size
+            return np.array([self._fw / 2, self._fh / 2]), size
 
-        # auto: ボールと選手集団を w_ball で加重合成（ハード切替なし）。
-        if players is None:
-            # 選手が居ない（稀）→ ボール主体。
-            cx, cy = ball_xy
-            return cx, cy, self._fw * _BALL_MARGIN * 2, self._fh * _BALL_MARGIN * 2
+        pcx, pcy = (players[0], players[1]) if players else (self._fw / 2, self._fh / 2)
+        w_ball = self._ball_weight(ball)
+        if self._mode == "ball" and ball.visible:
+            w_ball = 1.0
 
-        pcx, pcy, pw, ph = players
-        if ball_xy is None:
-            # ボール喪失 → 選手集団のみ。
-            return pcx, pcy, pw, ph
+        if ball.visible and w_ball > 0:
+            bxy = np.array([ball.x, ball.y], dtype=np.float64) + self._lead_room(ball)
+            cx = w_ball * bxy[0] + (1 - w_ball) * pcx
+            cy = w_ball * bxy[1] + (1 - w_ball) * pcy
+        else:
+            self._lead_room(ball)  # ボール履歴をリセット
+            cx, cy = pcx, pcy
+        return np.array([cx, cy], dtype=np.float64), size
 
-        bcx, bcy = ball_xy
-        cx = w_ball * bcx + (1.0 - w_ball) * pcx
-        cy = w_ball * bcy + (1.0 - w_ball) * pcy
-        # サイズもボールタイト枠と選手包含枠を加重合成。ボール主体ほど寄る。
-        bw, bh = self._fw * _BALL_MARGIN * 2, self._fh * _BALL_MARGIN * 2
-        w = w_ball * bw + (1.0 - w_ball) * pw
-        h = w_ball * bh + (1.0 - w_ball) * ph
-        return cx, cy, w, h
-
-    # ── 平滑化（pan / zoom 分離＋速度制限＋デッドゾーン） ──────────────────────────
-
-    def _smooth_center(self, target: np.ndarray) -> np.ndarray:
-        assert self._center is not None
-        delta = target - self._center
-        dist = float(np.linalg.norm(delta))
-        # デッドゾーン内のターゲット移動は無視（微小揺れのジッター抑制）。
-        if dist < self._deadzone:
-            return self._center
-        step = self._pan_alpha * delta
-        # 1 フレームの pan 量を上限でクランプ（急なカメラ振りを防ぐ）。
-        snorm = float(np.linalg.norm(step))
-        if snorm > self._max_pan:
-            step = step / snorm * self._max_pan
-        return self._center + step
-
-    def _smooth_size(self, target: np.ndarray) -> np.ndarray:
-        assert self._size is not None
-        step = self._zoom_alpha * (target - self._size)
-        # 1 フレームのサイズ変化を現サイズ比で上限クランプ（ズーム往復を抑制）。
-        cap = self._max_zoom_rate * self._size
-        step = np.clip(step, -cap, cap)
-        return self._size + step
+    # ── 仕上げ（アスペクト維持・クランプ）────────────────────────────────────────
 
     def _clamp_roi(self, cx: float, cy: float, w: float, h: float) -> ROI:
-        """アスペクト維持・最小/最大サイズ・フレーム内クランプを適用。
-
-        フレーム境界クランプ後にアスペクト比を再適用する。
-        フレームが出力アスペクト比より横長（例: 2160×650 ≈ 3.3:1）の場合、
-        高さは常にフレーム高に頭打ちされ、幅が h×aspect で確定する。
-        この再計算を省くとフレームごとにアスペクト比がばらつき映像が歪む。
-        """
-        w = float(np.clip(w, self._fw * _MIN_ROI_FRAC, self._fw * _MAX_ROI_FRAC))
-        h = float(np.clip(h, self._fh * _MIN_ROI_FRAC, self._fh * _MAX_ROI_FRAC))
-        # 目標アスペクト比に合わせる。
+        """アスペクト維持・最小/最大・フレーム内クランプ。境界後にアスペクト再適用。"""
+        w = float(np.clip(w, self._fw * _MIN_ZOOM * self._aspect, self._fw))
+        h = float(np.clip(h, self._fh * _MIN_ZOOM, self._fh))
         if w / h > self._aspect:
             h = w / self._aspect
         else:
             w = h * self._aspect
-        # フレーム境界クランプ後、はみ出した側を縮め、もう一方の辺もアスペクト再適用。
         if w > self._fw:
             w = float(self._fw)
             h = w / self._aspect
         if h > self._fh:
             h = float(self._fh)
             w = h * self._aspect
-        # 高さ再クランプ後に幅がまたはみ出す可能性（超横長フレーム）。
         w = min(w, self._fw)
         x = int(np.clip(cx - w / 2, 0, self._fw - w))
         y = int(np.clip(cy - h / 2, 0, self._fh - h))
@@ -272,26 +277,28 @@ class FramingCalculator:
         self,
         ball: BallState,
         tracks: list[Track],
-        game_active: bool = True,
+        game_state: GameState = "rally",
+        highlight: bool = False,
     ) -> ROI:
-        """このフレームの平滑化済みクロップ ROI を返す。
+        """このフレームの平滑化済み ROI を返す。
 
         Args:
-            ball:        BallState（visible / predicted / lost）。
-            tracks:      framing 対象の field 選手トラック。
-            game_active: participation.game_active。False（タイムアウト／セット間）
-                         ではボールを追わず wide に保持する。既定 True。
+            ball:       BallState（visible / predicted / lost）。
+            tracks:     framing 対象の field 選手トラック。
+            game_state: "rally" / "service" / "no_play"（game_state.py が供給）。
+            highlight:  ズームイン演出のトリガ（スパイク等; 現状プレースホルダ）。
         """
-        tcx, tcy, tw, th = self._target(ball, tracks, game_active)
-        target_c = np.array([tcx, tcy], dtype=np.float64)
-        target_s = np.array([tw, th], dtype=np.float64)
+        target_c, target_s = self._target(ball, tracks, game_state, highlight)
 
         if self._center is None:
             self._center = target_c.copy()
             self._size = target_s.copy()
         else:
-            self._center = self._smooth_center(target_c)
-            self._size = self._smooth_size(target_s)
+            self._center, self._center_vel = _smooth_damp(
+                self._center, target_c, self._center_vel,
+                self._pan_t, self._dt, self._max_pan_speed)
+            self._size, self._size_vel = _smooth_damp(
+                self._size, target_s, self._size_vel, self._zoom_t, self._dt)
 
         return self._clamp_roi(self._center[0], self._center[1],
                                self._size[0], self._size[1])

@@ -1,10 +1,10 @@
-"""Phase 5 framing tests: smoothness, ball-confidence blend, game-pause hold.
+"""Phase 5 framing tests: critically-damped smoothing + state-aware framing.
 
 Drives FramingCalculator directly with synthetic BallState / Track sequences —
-no GPU, no models. Asserts the *behaviours* the broadcast-smooth design promises
-(docs/phase5_framing.md): bounded per-frame motion, no hard ball/wide jump on a
-one-frame ball drop, dead-zone jitter rejection, and a wide hold when the game
-is paused.
+no GPU, no models. Asserts the broadcast-smooth design promises
+(docs/phase5_framing.md): constant 16:9 aspect, smooth (low-jerk) panning, a
+wide hold in NO_PLAY, a wider shot in SERVICE, no hard jump on a one-frame ball
+drop, and that the critically-damped spring settles without oscillation.
 
 Run:  python tests/test_framing.py   (or pytest)
 """
@@ -25,7 +25,8 @@ if "onnxruntime" not in sys.modules:
         sys.modules["onnxruntime"] = types.ModuleType("onnxruntime")
 
 from alt_pix.ball_tracker import BallState
-from alt_pix.framing import ROI, FramingCalculator
+from alt_pix.framing import ROI, FramingCalculator, _smooth_damp
+import numpy as np
 from alt_pix.tracker import Track
 
 _FW, _FH = 1920, 1080
@@ -40,12 +41,25 @@ def _track(tid, fx, fy) -> Track:
 
 
 def _players(centre_x: float) -> list[Track]:
-    """6 players spread around centre_x at mid-height."""
     return [_track(i, centre_x - 150 + 60 * i, 600) for i in range(6)]
 
 
 def _roi_center(roi: ROI) -> tuple[float, float]:
     return roi.x + roi.w / 2, roi.y + roi.h / 2
+
+
+def test_smooth_damp_settles_without_overshoot():
+    """The spring converges monotonically to target, never overshooting."""
+    cur = np.array([0.0, 0.0])
+    vel = np.array([0.0, 0.0])
+    target = np.array([100.0, 0.0])
+    prev = -1.0
+    for _ in range(400):
+        cur, vel = _smooth_damp(cur, target, vel, 0.5, 1 / 30)
+        assert cur[0] <= 100.0 + 1e-6, "overshoot past target"
+        assert cur[0] >= prev - 1e-6, "non-monotonic (oscillation)"
+        prev = cur[0]
+    assert abs(cur[0] - 100.0) < 1.0, "did not converge"
 
 
 def test_roi_valid_and_aspect():
@@ -54,107 +68,81 @@ def test_roi_valid_and_aspect():
     assert roi.w > 0 and roi.h > 0
     assert 0 <= roi.x <= _FW - roi.w
     assert 0 <= roi.y <= _FH - roi.h
-    # aspect ratio honoured (16:9 within rounding).
     assert abs(roi.w / roi.h - 16 / 9) < 0.05
 
 
-def test_pan_is_rate_limited():
-    """A teleporting ball must not snap the camera; per-frame pan is bounded."""
+def test_aspect_ratio_constant_on_wide_source():
+    """16:9 every frame even on an ultra-wide crop source (regression)."""
+    fr = FramingCalculator(2160, 650, output_aspect=16 / 9, mode="auto")
+    players = _players(1080)
+    for state in [_ball(900, 300), _ball(1500, 200),
+                  _ball(0, 0, visible=False), _ball(960, 300, predicted=True)] * 15:
+        roi = fr.compute(state, players)
+        assert abs(roi.w / max(roi.h, 1) - 16 / 9) < 0.05
+
+
+def test_panning_is_smooth_low_jerk():
+    """Following a steadily moving ball produces low frame-to-frame acceleration."""
     fr = FramingCalculator(_FW, _FH, mode="auto")
-    fr.compute(_ball(300, 540), _players(300))  # settle left
-    c0 = _roi_center(fr.compute(_ball(300, 540), _players(300)))
-    # Ball + players jump hard to the right edge.
-    c1 = _roi_center(fr.compute(_ball(1700, 540), _players(1700)))
-    moved = abs(c1[0] - c0[0])
-    # max_pan_frac default 0.04 -> <= ~77px per frame (allow rounding slack).
-    assert moved <= 0.04 * _FW + 2, f"pan {moved:.1f}px exceeded rate limit"
+    centers = []
+    for f in range(120):
+        bx = 400 + f * 8  # ball pans steadily right
+        players = _players(960)  # players anchor centre
+        roi = fr.compute(_ball(bx, 400), players)
+        centers.append(_roi_center(roi)[0])
+    # 2nd difference (acceleration) RMS should be tiny — spring is smooth.
+    d2 = [centers[i] - 2 * centers[i - 1] + centers[i - 2] for i in range(2, len(centers))]
+    rms = (sum(v * v for v in d2) / len(d2)) ** 0.5
+    assert rms < 1.0, f"pan jerk too high: {rms:.3f}px/frame^2"
 
 
 def test_one_frame_ball_drop_does_not_jump():
-    """A single lost-ball frame should barely move the camera (no wide snap)."""
-    fr = FramingCalculator(_FW, _FH, mode="auto")
-    for _ in range(40):  # converge on a tracked ball
-        fr.compute(_ball(900, 400), _players(900))
-    c_before = _roi_center(fr.compute(_ball(900, 400), _players(900)))
-    # One frame with the ball lost (players unchanged).
-    c_drop = _roi_center(fr.compute(_ball(0, 0, visible=False), _players(900)))
-    jump = abs(c_drop[0] - c_before[0]) + abs(c_drop[1] - c_before[1])
-    assert jump <= 0.04 * _FW + 2, f"ball drop jumped {jump:.1f}px"
-
-
-def test_deadzone_rejects_micro_jitter():
-    """Tiny ball wobble inside the dead-zone leaves the camera centre fixed."""
     fr = FramingCalculator(_FW, _FH, mode="auto")
     for _ in range(60):
-        fr.compute(_ball(960, 540), _players(960))
-    c0 = _roi_center(fr.compute(_ball(960, 540), _players(960)))
-    # Jitter the ball by a few px (< deadzone 0.03*1920 = 57.6px) for many frames.
-    for k in range(20):
-        c = _roi_center(fr.compute(_ball(960 + (k % 2) * 10, 540), _players(960)))
-    assert abs(c[0] - c0[0]) < 5.0, "camera drifted on sub-deadzone jitter"
+        fr.compute(_ball(900, 400), _players(900))
+    c_before = _roi_center(fr.compute(_ball(900, 400), _players(900)))
+    c_drop = _roi_center(fr.compute(_ball(0, 0, visible=False), _players(900)))
+    jump = abs(c_drop[0] - c_before[0]) + abs(c_drop[1] - c_before[1])
+    assert jump < 15.0, f"ball drop jumped {jump:.1f}px"
 
 
-def test_predicted_ball_pulls_toward_players():
-    """Predicted (interpolated) ball weights players more than a detected ball."""
-    fr_vis = FramingCalculator(_FW, _FH, mode="auto")
-    fr_pred = FramingCalculator(_FW, _FH, mode="auto")
-    # Ball far right, players far left: detected ball should sit further right
-    # than the same ball flagged predicted (which leans toward the players).
-    players = _players(400)
-    cx_vis = cx_pred = 0.0
-    for _ in range(30):
-        cx_vis = _roi_center(fr_vis.compute(_ball(1500, 540), players))[0]
-        cx_pred = _roi_center(fr_pred.compute(_ball(1500, 540, predicted=True), players))[0]
-    assert cx_vis > cx_pred + 10, "predicted ball did not lean toward players"
-
-
-def test_game_pause_holds_wide_not_ball():
-    """When paused, the camera ignores the ball and holds a wide player shot."""
+def test_no_play_holds_wide_and_freezes_pan():
+    """NO_PLAY widens the shot and stops chasing the ball."""
     fr = FramingCalculator(_FW, _FH, mode="auto")
-    # Active: converge tight on a right-side ball.
-    for _ in range(40):
-        fr.compute(_ball(1600, 300), _players(1600), game_active=True)
-    roi_active = fr.compute(_ball(1600, 300), _players(1600), game_active=True)
-    # Now paused with players regrouped centre; ball still off right.
-    roi_pause = roi_active
-    for _ in range(80):
-        roi_pause = fr.compute(_ball(1600, 300), _players(960), game_active=False)
-    # Paused shot is wider (bigger ROI) and centred on players, not the ball.
-    assert roi_pause.w > roi_active.w, "paused shot should widen"
-    assert _roi_center(roi_pause)[0] < _roi_center(roi_active)[0], "should leave the ball"
+    for _ in range(60):
+        fr.compute(_ball(1600, 300), _players(1600), game_state="rally")
+    roi_rally = fr.compute(_ball(1600, 300), _players(1600), game_state="rally")
+    roi_pause = roi_rally
+    for _ in range(120):
+        roi_pause = fr.compute(_ball(1600, 300), _players(960), game_state="no_play")
+    assert roi_pause.w > roi_rally.w, "no_play should widen"
+    # Pan should not follow the ball (which sits far right) during no_play.
+    c_pause = _roi_center(roi_pause)[0]
+    c_rally = _roi_center(roi_rally)[0]
+    assert c_pause < c_rally, "no_play should not chase the ball right"
 
 
-def test_zoom_is_rate_limited():
-    """Size cannot change faster than max_zoom_rate per frame."""
+def test_service_is_wider_than_rally():
+    """SERVICE pulls to a wider shot than RALLY."""
+    fr_r = FramingCalculator(_FW, _FH, mode="auto")
+    fr_s = FramingCalculator(_FW, _FH, mode="auto")
+    players = _players(960)
+    wr = ws = 0
+    for _ in range(120):
+        wr = fr_r.compute(_ball(960, 400), players, game_state="rally").w
+        ws = fr_s.compute(_ball(960, 400), players, game_state="service").w
+    assert ws > wr, f"service ({ws}) should be wider than rally ({wr})"
+
+
+def test_rally_ball_leans_off_player_centroid():
+    """In RALLY the ball still pulls the frame off the player centroid."""
     fr = FramingCalculator(_FW, _FH, mode="auto")
-    roi_prev = fr.compute(_ball(960, 540), _players(960))
-    # Force a big size target swing: ball lost -> wide players, tight players.
-    roi_now = fr.compute(_ball(0, 0, visible=False), _players(960))
-    rate = abs(roi_now.w - roi_prev.w) / max(roi_prev.w, 1)
-    assert rate <= 0.03 + 0.02, f"zoom rate {rate:.3f} exceeded cap"
-
-
-def test_aspect_ratio_constant_across_frames():
-    """ROI aspect ratio must stay 16:9 every frame — no per-frame distortion.
-
-    Regression test for the Phase 5 NG finding: when the source is wider than
-    16:9 (e.g. 2160×650), the frame-bound clamp was breaking aspect, causing
-    the rendered video to stretch/squash frame-to-frame.
-    """
-    # Use a wide-crop source like the evaluation video (2160×650, aspect 3.32:1).
-    fr = FramingCalculator(2160, 650, output_aspect=16 / 9, mode="auto")
-    players = _players(1080)
-    for state in [
-        _ball(900, 300),                              # visible, tight
-        _ball(1500, 200),                             # visible, right edge
-        _ball(0, 0, visible=False),                   # lost
-        _ball(960, 300, predicted=True),              # predicted
-    ] * 15:
-        roi = fr.compute(state, players)
-        aspect = roi.w / max(roi.h, 1)
-        assert abs(aspect - 16 / 9) < 0.05, (
-            f"aspect {aspect:.3f} != 16/9 for ROI {roi.w}×{roi.h}"
-        )
+    players = _players(500)  # players left
+    cx = 0.0
+    for _ in range(150):
+        cx = _roi_center(fr.compute(_ball(1500, 400), players, game_state="rally"))[0]
+    pc = 500.0
+    assert cx > pc + 50, "ball did not pull the frame toward itself in rally"
 
 
 def _run_all() -> None:

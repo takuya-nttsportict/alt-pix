@@ -36,6 +36,7 @@ from alt_pix.ball_tracker import BallTracker
 from alt_pix.court import CourtCalibration
 from alt_pix.detector import YOLOXDetector, _COCO_PERSON, _COCO_SPORTS_BALL
 from alt_pix.framing import FramingCalculator
+from alt_pix.game_state import GameStateEstimator
 from alt_pix.jersey_ocr import JerseyOCR
 from alt_pix.log_config import setup_logging
 from alt_pix.output import JSONLWriter, VideoWriter, _make_record
@@ -197,6 +198,12 @@ def main() -> None:
     video_writer: VideoWriter | None = None
     framing: FramingCalculator | None = None
 
+    # ── Game-state estimator (drives state-aware framing) ──────────────────────
+    # Shares the role classifier's participation tracker (on-court count EMA) so
+    # NO_PLAY (timeout / set break) and SERVICE (ball at endline) gate framing.
+    game_state_est = GameStateEstimator(
+        court, role_clf.participation if role_clf is not None else None)
+
     # ── Stats ──────────────────────────────────────────────────────────────────
     t_start = time.time()
     n_frames = 0
@@ -261,11 +268,12 @@ def main() -> None:
                 jersey_map = ocr.update(frame, tracks)
 
             # ── Framing ───────────────────────────────────────────────────────
-            # During timeouts / set breaks the on-court count collapses; the
-            # participation tracker flags this as game_active=False, and framing
-            # holds a wide shot instead of chasing the ball / people walking off.
-            game_active = role_clf.participation.game_active if role_clf is not None else True
-            roi = framing.compute(ball_state, field_tracks, game_active=game_active)
+            # State-aware camera work: RALLY follows ball+players at mid zoom;
+            # SERVICE pulls wide to the server's endline; NO_PLAY (timeout / set
+            # break) freezes the pan and holds a wide shot. Critically-damped
+            # spring smoothing inside FramingCalculator removes the EMA jitter.
+            game_state = game_state_est.update(ball_state, field_tracks)
+            roi = framing.compute(ball_state, field_tracks, game_state=game_state)
 
             # ── Output ────────────────────────────────────────────────────────
             record = _make_record(frame_id, ts * 1000, ball_state, tracks, jersey_map, roi)
@@ -298,7 +306,7 @@ def main() -> None:
                 f"team_ready={'Y' if (assigner and assigner.ready) else 'N'} "
                 f"ball={'Y' if ball_state.visible else 'N'} "
                 f"ball_conf={ball_state.conf:.2f} "
-                f"game={'PLAY' if game_active else 'PAUSE'} "
+                f"state={game_state} "
                 f"roi=({roi.x},{roi.y},{roi.w},{roi.h})"
             )
 
