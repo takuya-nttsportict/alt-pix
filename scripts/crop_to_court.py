@@ -50,9 +50,9 @@ def parse_args() -> argparse.Namespace:
                    help="remapped court.json for the cropped video")
     # マージン（px）: 奥側選手は遠ライン上に立ち頭が上に伸びるので top を厚めに、
     # 手前選手はジャンプ/頭上余白で側方より上が必要。
-    p.add_argument("--margin-top", type=float, default=100.0)
-    p.add_argument("--margin-bottom", type=float, default=40.0)
-    p.add_argument("--margin-side", type=float, default=80.0)
+    p.add_argument("--margin-top", type=float, default=200.0)
+    p.add_argument("--margin-bottom", type=float, default=80.0)
+    p.add_argument("--margin-side", type=float, default=200.0)
     p.add_argument("--fps", type=float, default=25.0)
     p.add_argument("--max-frames", type=int, default=0, help="0 = all frames")
     return p.parse_args()
