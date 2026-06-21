@@ -141,6 +141,27 @@ def test_game_active_pauses_when_court_empty():
     assert pt.game_active is False
 
 
+def test_off_court_zone_endline_sideline_corner():
+    """Court metres zones: end-line=player, sideline=referee, corner=ambiguous."""
+    c = _court()  # x:0..1000 -> u:0..18, y:0..500 -> v:0..9
+    # On court.
+    assert c.off_court_zone((490, 210, 510, 250)) == "on"
+    # Past the right END line (u>18), between sidelines -> serving zone.
+    assert c.off_court_zone((1190, 210, 1210, 250)) == "endline"
+    # Past the bottom SIDE line (v>9), between end lines -> referee zone.
+    assert c.off_court_zone((490, 760, 510, 800)) == "sideline"
+    # Past BOTH (corner) -> ambiguous (line judge).
+    assert c.off_court_zone((1190, 760, 1210, 800)) == "corner"
+
+
+def test_off_zone_recorded_on_state():
+    pt = ParticipationTracker(_court(), min_frames=5)
+    st = pt.update([_track(1, 1200, 250)])[1]   # behind the right end line
+    assert st.off_zone == "endline"
+    st = pt.update([_track(2, 500, 800)])[2]     # past the sideline
+    assert st.off_zone == "sideline"
+
+
 def _run_all() -> None:
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

@@ -55,6 +55,7 @@ class _PartState:
     frames_since_exit: int = 999    # frames since last leaving the court (999 = never inside)
     assume_server: bool = False     # exited across an END line (u-axis) -> likely a server
     recently_exited: bool = False   # within the (direction-dependent) grace window after exit
+    off_zone: str = "on"            # current zone: on / endline / sideline / corner
 
 
 @dataclass
@@ -124,6 +125,8 @@ class ParticipationTracker:
             on = 1.0 if on_court_now else 0.0
             st.on_court_ema += self.alpha * (on - st.on_court_ema)
             st.on_court_now = on_court_now
+            # Directional zone for off-court people (serving zone vs referee zone).
+            st.off_zone = "on" if on_court_now else self.court.off_court_zone(t.bbox)
 
             # ── asymmetric grace (fast-in / slow-out) ─────────────────────────
             # Only players enter the court, so when someone steps out we keep
@@ -138,7 +141,7 @@ class ParticipationTracker:
                 st.recently_exited = False
             elif st.was_on_court:
                 if st.frames_since_exit == 0:  # the exit frame: classify direction
-                    st.assume_server = self._exited_via_endline(foot)
+                    st.assume_server = st.off_zone == "endline"
                 st.frames_since_exit += 1
                 window = self.serve_grace_frames if st.assume_server else self.grace_frames
                 st.recently_exited = st.frames_since_exit <= window
@@ -186,21 +189,6 @@ class ParticipationTracker:
         if self._frames_total < self.min_frames:
             return True
         return self._on_court_count_ema >= self.min_active_on_court
-
-    def _exited_via_endline(self, foot: tuple[float, float]) -> bool:
-        """True if the foot is outside an END line (u-axis) more than a sideline.
-
-        Court metres: u in [0,18] is the length (end lines at u=0 / u=18, net at
-        u=9); v in [0,9] is the width (sidelines at v=0 / v=9). A serve happens
-        behind an end line, so an exit dominated by the u-axis -> assume server.
-        """
-        try:
-            u, v = self.court.image_to_court(foot[0], foot[1])
-        except Exception:  # pragma: no cover - degenerate homography
-            return False
-        du = max(0.0 - u, u - 18.0, 0.0)   # how far past an end line
-        dv = max(0.0 - v, v - 9.0, 0.0)    # how far past a sideline
-        return du > 0.0 and du >= dv
 
     def _score(self, st: _PartState) -> float:
         motion_score = min(1.0, st.motion_ema / max(self.motion_ref, 1e-6))

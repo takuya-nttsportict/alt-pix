@@ -109,6 +109,41 @@ class CourtCalibration:
             result.append(self._point_in_court(cx, cy, self.ball_margin))
         return result
 
+    def off_court_zone(self, bbox: tuple, margin_m: float = 0.5) -> str:
+        """Classify a foot's position relative to the court, in court metres.
+
+        Court metres (from the 4 corners [TL,TR,BR,BL]):
+          u in [0,18] = length (END lines at u=0 / u=18 = TL-BL / TR-BR),
+          v in [0,9]  = width  (SIDE lines at v=0 / v=9 = TL-TR / BL-BR).
+
+        Returns:
+          "on"       inside the court (within margin_m of the lines).
+          "endline"  clearly past an END line but BETWEEN the sidelines — the
+                     serving zone behind TL-BL / TR-BR. A person here is very
+                     likely a PLAYER (a server), per the user's spatial prior.
+          "sideline" clearly past a SIDE line but BETWEEN the end lines — above
+                     TL-TR / below BL-BR, where referees / line judges / the
+                     bench stand. A person here is very likely a NON-player.
+          "corner"   past BOTH (the corner region): ambiguous — a line judge may
+                     stand here, so leave the decision to other signals.
+        """
+        x1, y1, x2, y2 = bbox
+        foot_x = (x1 + x2) / 2
+        foot_y = y2
+        try:
+            u, v = self.image_to_court(foot_x, foot_y)
+        except Exception:  # pragma: no cover - degenerate homography
+            return "corner"
+        u_out = u < -margin_m or u > _COURT_W + margin_m
+        v_out = v < -margin_m or v > _COURT_H + margin_m
+        if not u_out and not v_out:
+            return "on"
+        if u_out and not v_out:
+            return "endline"
+        if v_out and not u_out:
+            return "sideline"
+        return "corner"
+
     # ── Coordinate transforms ─────────────────────────────────────────────────
 
     def image_to_court(self, x: float, y: float) -> tuple[float, float]:

@@ -147,6 +147,15 @@ class RoleClassifier:
                 reasons[tid] = f"{tag} ({st.frames_since_exit}f ago) -> field [{expl}]"
                 continue
 
+            # Spatial prior (user 2026-06): someone directly BEHIND an end line
+            # (TL-BL left / TR-BR right), between the sidelines, is in the
+            # serving zone — very likely a PLAYER even without on-court history.
+            # Corners are excluded (off_zone="corner") so line judges are spared.
+            if st is not None and st.off_zone == "endline":
+                roles[tid] = "field"
+                reasons[tid] = f"behind end line (serving zone) -> field [{expl}]"
+                continue
+
             if st is None or st.frames < self._part.min_frames:
                 roles[tid] = "off"
                 reasons[tid] = f"gathering evidence -> off [{expl}]"
@@ -167,7 +176,9 @@ class RoleClassifier:
                 why = (f"colour outlier d={d:.3f}>thr={thr:.3f}"
                        if (d is not None and np.isfinite(d) and thr is not None)
                        else "no colour signal")
-                reasons[tid] = f"not participating + {why} -> referee [{expl}]"
+                # Beyond a sideline (above TL-TR / below BL-BR) is referee territory.
+                zone = f", {st.off_zone} zone" if st is not None and st.off_zone != "on" else ""
+                reasons[tid] = f"not participating + {why}{zone} -> referee [{expl}]"
 
         self._last_reasons = reasons
         return roles

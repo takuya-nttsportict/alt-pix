@@ -143,6 +143,26 @@ def test_role_classifier_defers_until_enough_frames():
     assert on[2] == "field"
 
 
+def test_role_classifier_endline_zone_is_field():
+    """Spatial prior: a person behind an end line (serving zone) is a player,
+    even with no on-court history; a corner (line judge) is NOT forced to field."""
+    try:
+        from alt_pix.court import CourtCalibration
+        from alt_pix.participation import ParticipationTracker
+        from alt_pix.roles import RoleClassifier
+    except Exception as e:  # pragma: no cover
+        print(f"SKIP endline test (cv2 unavailable): {e!r}")
+        return
+    court = CourtCalibration(corners=[(0, 0), (1000, 0), (1000, 500), (0, 500)])
+    rc = RoleClassifier(court, participation=ParticipationTracker(court, min_frames=30))
+    # Behind the right end line (u>18), between sidelines -> field immediately.
+    behind = rc.classify([_track(1, 1200, 250)], {1: -1}, {})
+    assert behind[1] == "field"
+    # Corner (past both lines) is ambiguous -> not forced to field (still gathering).
+    corner = rc.classify([_track(2, 1200, 900)], {2: -1}, {})
+    assert corner[2] != "field"
+
+
 def _run_all() -> None:
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:
