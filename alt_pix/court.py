@@ -84,6 +84,22 @@ class CourtCalibration:
             result.append(self._point_in_court(foot_x, foot_y, self.player_margin))
         return result
 
+    def foot_distance(self, bbox: tuple) -> float:
+        """Signed distance (px) from the player's foot to the court polygon.
+
+        Positive = inside, negative = outside. Used for on-court vs off-court
+        role classification (field players vs bench/referee on the sideline).
+        """
+        x1, y1, x2, y2 = bbox
+        foot_x = (x1 + x2) / 2
+        foot_y = y2
+        return float(cv2.pointPolygonTest(self._poly, (foot_x, foot_y), measureDist=True))
+
+    def is_on_court(self, bbox: tuple, margin: float | None = None) -> bool:
+        """True if the player's foot is within `margin` px of the court polygon."""
+        m = self.player_margin if margin is None else margin
+        return self.foot_distance(bbox) >= -m
+
     def filter_ball(self, bboxes: list[tuple]) -> list[bool]:
         """Return mask: True = detection is within ball margin of court."""
         result = []

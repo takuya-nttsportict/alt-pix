@@ -39,7 +39,9 @@ from alt_pix.framing import FramingCalculator
 from alt_pix.jersey_ocr import JerseyOCR
 from alt_pix.log_config import setup_logging
 from alt_pix.output import JSONLWriter, VideoWriter, _make_record
+from alt_pix.roles import RoleClassifier
 from alt_pix.stream import iter_frames
+from alt_pix.team_classifier import TeamClassifier
 from alt_pix.tracknet import TrackNetDetector
 from alt_pix.tracker import PlayerTracker
 from alt_pix.visualizer import annotate
@@ -68,6 +70,18 @@ def parse_args() -> argparse.Namespace:
     # Tracking
     p.add_argument("--track-thresh",  type=float, default=0.5)
     p.add_argument("--track-buffer",  type=int,   default=30)
+
+    # Perception core (Phase 4): team classification + role filtering
+    p.add_argument("--no-team", action="store_true",
+                   help="Disable team (uniform) classification")
+    p.add_argument("--team-backend", choices=["siglip", "hsv"], default="siglip",
+                   help="Uniform embedding backend (siglip falls back to hsv if unavailable)")
+    p.add_argument("--no-role", action="store_true",
+                   help="Disable role classification (field/bench/referee). "
+                        "Requires --court.")
+    p.add_argument("--scene-margin", type=float, default=300.0,
+                   help="Keep people within this many px of the court (drops far "
+                        "spectators); requires --court. Bench/referee fall inside it.")
 
     # OCR
     p.add_argument("--no-ocr", action="store_true", help="Disable jersey OCR")
@@ -145,6 +159,23 @@ def main() -> None:
             "All detections will be used without spatial filtering."
         )
 
+    # ── Team classification + role filtering (Phase 4 perception core) ─────────
+    team_clf: TeamClassifier | None = None
+    if not args.no_team:
+        logger.info(f"Initialising team classifier (backend={args.team_backend}) …")
+        team_clf = TeamClassifier(backend=args.team_backend, device=args.device)
+
+    role_clf: RoleClassifier | None = None
+    if not args.no_role:
+        if court is not None:
+            logger.info("Initialising role classifier (court geometry + colour outlier) …")
+            role_clf = RoleClassifier(court)
+        else:
+            logger.warning(
+                "Role classification requested but no --court given; disabled. "
+                "Roles need court geometry to separate field / bench / referee."
+            )
+
     # ── OCR ───────────────────────────────────────────────────────────────────
     ocr = None
     if not args.no_ocr:
@@ -182,8 +213,12 @@ def main() -> None:
 
             # ── Court filtering ────────────────────────────────────────────────
             if court is not None:
-                p_mask = court.filter_players([d.bbox for d in person_dets])
-                person_dets = [d for d, ok in zip(person_dets, p_mask) if ok]
+                # Drop far spectators. When role classification is on we keep a
+                # wider band (scene margin) so bench/referee survive to be
+                # *labelled* rather than discarded — analytics needs them too.
+                keep_margin = args.scene_margin if role_clf is not None else court.player_margin
+                person_dets = [d for d in person_dets
+                               if court.is_on_court(d.bbox, keep_margin)]
 
                 b_mask = court.filter_ball([d.bbox for d in ball_dets])
                 ball_dets = [d for d, ok in zip(ball_dets, b_mask) if ok]
@@ -192,12 +227,29 @@ def main() -> None:
             tracks    = tracker.update(person_dets, frame)
             ball_state = ball_tracker.update(ball_dets)
 
+            # ── Team classification + role labelling (perception core) ─────────
+            dist_map: dict[int, float] = {}
+            if team_clf is not None:
+                team_map, dist_map = team_clf.update(frame, tracks)
+                for t in tracks:
+                    tm = team_map.get(t.track_id, -1)
+                    t.team = tm if tm >= 0 else None
+            if role_clf is not None:
+                team_map_safe = {t.track_id: (t.team if t.team is not None else -1)
+                                 for t in tracks}
+                role_map = role_clf.classify(tracks, team_map_safe, dist_map)
+                for t in tracks:
+                    t.role = role_map.get(t.track_id)
+
+            # Field players (framing-relevant). Without role info, treat all as field.
+            field_tracks = [t for t in tracks if t.role in (None, "field")]
+
             # ── OCR ───────────────────────────────────────────────────────────
             if ocr is not None:
                 jersey_map = ocr.update(frame, tracks)
 
             # ── Framing ───────────────────────────────────────────────────────
-            roi = framing.compute(ball_state, tracks)
+            roi = framing.compute(ball_state, field_tracks)
 
             # ── Output ────────────────────────────────────────────────────────
             record = _make_record(frame_id, ts * 1000, ball_state, tracks, jersey_map, roi)
@@ -221,10 +273,13 @@ def main() -> None:
             if ball_state.visible:
                 ball_visible_frames += 1
 
+            n_field = sum(1 for t in tracks if t.role in (None, "field"))
+            n_ref = sum(1 for t in tracks if t.role == "referee")
             logger.debug(
                 f"frame={frame_id:5d} ts={ts:7.2f}s "
                 f"persons={len(person_dets):2d} "
-                f"tracks={len(tracks):2d} "
+                f"tracks={len(tracks):2d} field={n_field:2d} ref={n_ref:1d} "
+                f"team_ready={'Y' if (team_clf and team_clf.ready) else 'N'} "
                 f"ball={'Y' if ball_state.visible else 'N'} "
                 f"ball_conf={ball_state.conf:.2f}"
             )

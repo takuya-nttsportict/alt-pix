@@ -98,6 +98,72 @@ MOT17/Duke/SoccerNet/SVHN 学習済み重みは商用不可）。
 Ultralytics YOLO（AGPL）、BoxMOT（AGPL）、StrongSORT（GPL）、SportsLabKit（GPL）、
 volleyball_analytics（GPL）、VolleyVision（無ライセンス＋AGPL 依存）。
 
+## コート幾何の次元（2D 平面 vs 3D 立体）— 設計判断
+
+フレーミング向けに **2D 平面ホモグラフィで十分**と判断した。根拠：
+
+| 用途 | 必要情報 | 2D で解けるか |
+|---|---|---|
+| 役割フィルタ（場内/場外） | 床平面上の足元位置 | ✅ 十分 |
+| 仮想カメラ ROI 算出 | 画面ピクセル範囲 | ✅ 十分（奥行き不要）|
+| 選手オクルージョン解消（誰が前か） | 奥行き | ❌ だが**フレーミングは個人識別不要**なので不要 |
+| ボールのネット上高さ等の計量 | metric 3D | ❌ → 試合分析（Phase 6）で必要 |
+
+フレーミングの核心は「どのピクセル範囲をクロップするか」であり、奥行きは本質的に不要。
+3D が要るのは Phase 6（試合分析）のオクルージョン解消・空間スタッツから。
+
+**昇格パス**: バレーコート実寸は規格固定（18m×9m, ネット高 2.43m）。現行の 4 端点
+ホモグラフィにメートルスケールを載せれば、**単眼カメラでも床平面（Z=0）の metric 再構成**が
+可能（追加センサ不要）。`画像 → H⁻¹ → コート正規化 → ×実寸(m)`。Phase 6 で床面 PnP に
+拡張し、ネット高など Z 方向を既知値として立体化する。よって Phase 4/5 は 2D、Phase 6 で
+同じ 4 端点から metric 3D へ継続的に拡張する。
+
+> 4 端点の**手動指定**自体は将来コートライン自動検出（ハフ変換／学習ベース）へ
+> 差し替え可能。自動化は毎試合の手間削減策として Phase 5/6 で判断する。
+
+## 実装（Phase 4 着手分）
+
+| ファイル | 役割 |
+|---|---|
+| `alt_pix/team_classifier.py` | チーム分類。SigLIP 埋め込み（Apache 2.0）→ 自前 2-means。warm-up でフィット、周期 refit。SigLIP 不在時は HSV ヒストグラムへ自動フォールバック |
+| `alt_pix/roles.py` | 役割分類。コート幾何（場内/場外）＋色外れ値（審判）。ロバスト閾値（median/MAD）＋EMA で境界安定化 |
+| `alt_pix/court.py` | `foot_distance` / `is_on_court` を追加（場内/場外の連続判定）|
+| `alt_pix/tracker.py` | `Track` に `team` / `role` を追加 |
+| `alt_pix/output.py` | JSONL スキーマに `team` / `role` を追加 |
+| `alt_pix/visualizer.py` | チーム色（amber/blue）、審判=黄、控え=灰で描画 |
+| `scripts/run_pipeline.py` | `--team-backend` / `--no-team` / `--no-role` / `--scene-margin` を追加。場外をドロップせず**役割ラベル付け**（分析でも控え・審判が必要なため）|
+| `scripts/debug_player_perception.py` | 知覚コア単体の可視化・評価 |
+| `tests/test_perception_core.py` | 2-means・役割分類・コート幾何の numpy 単体テスト（重依存不要）|
+
+### 設計上のポイント
+
+- **チーム分類は warm-up 後に確定**：最初の `--warmup` フレームでクロップを貯めて 2-means を
+  一度フィット、以後は各フレームを最近傍セントロイドへ割当。試合ごとに自己キャリブする。
+- **審判は色外れ値で検出**：場内選手の「最近傍チーム色距離」分布から median/MAD でロバスト
+  閾値を作り、それを超える場外者を審判とする。チームと同色の場外者は控え（bench）。
+- **場外を捨てずにラベル付け**：従来は場外検出を破棄していたが、分析用途では控え・審判も
+  必要。`--scene-margin` 内の人物は残し役割を付与、遠方観客のみドロップ。フレーミングには
+  `role=="field"` のみを渡す。
+- **依存の設計**（プリンシパル 6）：KMeans は numpy 自前実装でフォールバック経路を軽量・
+  決定的に保ち、scikit-learn 依存を避けた。SigLIP（transformers）はソフト依存。
+
+### 再現手順
+
+```bash
+# 知覚コア単体の可視化（チーム色・役割）
+python scripts/debug_player_perception.py \
+  --source videos/volley-2.mp4 --person-model models/yolox_m.onnx \
+  --court configs/court.json --out videos/perception_debug.mp4 --max-frames 600
+
+# フルパイプライン（team/role 付き JSONL 出力）
+python scripts/run_pipeline.py --source videos/volley-2.mp4 \
+  --person-model models/yolox_m.onnx --ball-model models/tracknet_volleyball.pt \
+  --court configs/court.json --out-json out.jsonl --out-video out.mp4
+
+# 単体テスト（重依存不要）
+python tests/test_perception_core.py
+```
+
 ## 普遍性の担保（入力条件変化への耐性）
 
 ユーザー懸念（画角・サイズが変わり得る）への対応：
