@@ -98,13 +98,24 @@ def main() -> None:
         if court is not None:
             court.draw(vis)
 
+        # 判定理由（参加度の内訳）を非 field の track に重畳して説明可能に。
+        for t in tracks:
+            if t.role in (None, "field"):
+                continue
+            x1, y1, x2, y2 = (int(v) for v in t.bbox)
+            reason = t.role_reason or ""
+            if reason:
+                cv2.putText(vis, reason[:60], (x1, y2 + 12),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.32, (200, 200, 200), 1, cv2.LINE_AA)
+
         n_field = sum(1 for t in tracks if t.role in (None, "field"))
         n_bench = sum(1 for t in tracks if t.role == "bench")
         n_ref = sum(1 for t in tracks if t.role == "referee")
+        n_off = sum(1 for t in tracks if t.role == "off")
         cv2.putText(vis,
                     f"f={frame_id} tracks={len(tracks)} field={n_field} "
-                    f"bench={n_bench} ref={n_ref} team_ready={team_clf.ready}",
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+                    f"bench={n_bench} ref={n_ref} off={n_off} {assigner.method}",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
         if writer is None:
             h, w = vis.shape[:2]
@@ -115,7 +126,8 @@ def main() -> None:
         n += 1
         if n % 100 == 0:
             print(f"[f={frame_id:5d}] tracks={len(tracks):2d} field={n_field:2d} "
-                  f"bench={n_bench:2d} ref={n_ref:2d} team_ready={team_clf.ready}")
+                  f"bench={n_bench:2d} ref={n_ref:2d} off={n_off:2d} "
+                  f"team_ready={assigner.ready}")
         if args.max_frames and n >= args.max_frames:
             break
 

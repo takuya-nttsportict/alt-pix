@@ -80,40 +80,62 @@ def test_team_predict_before_fit_returns_unassigned():
     assert labels.tolist() == [-1]
 
 
-# ── RoleClassifier (court geometry + colour outlier) ────────────────────────────
+# ── RoleClassifier (temporal participation + colour outlier) ────────────────────
+
+def _moving_track(tid: int, foot_x: float, foot_y: float) -> Track:
+    return _track(tid, foot_x, foot_y)
+
 
 def test_role_classifier_field_bench_referee():
     # Lazy import: court.py needs cv2 which is available in the runtime image.
     try:
         from alt_pix.court import CourtCalibration
+        from alt_pix.participation import ParticipationTracker
         from alt_pix.roles import RoleClassifier
     except Exception as e:  # pragma: no cover - cv2 missing in some dev shells
         print(f"SKIP role test (cv2 unavailable): {e!r}")
         return
 
-    # Axis-aligned court rectangle 0..1000 (x) by 0..500 (y) in image px.
     court = CourtCalibration(corners=[(0, 0), (1000, 0), (1000, 500), (0, 500)],
                              player_margin=80.0)
-    rc = RoleClassifier(court, field_margin=60.0)
+    # Short min_frames so the test converges quickly; fast EMA.
+    part = ParticipationTracker(court, alpha=0.2, min_frames=20, motion_ref=0.04)
+    rc = RoleClassifier(court, participation=part)
 
-    on = _track(1, 500, 250)    # inside court → field
-    bench = _track(2, 500, 800)  # well below court → off-court
-    ref = _track(3, 600, 800)    # off-court colour outlier → referee
+    # Accumulate evidence over a window. Players (on-court + moving) become
+    # field; a stationary off-court colour outlier becomes referee; a stationary
+    # off-court team-coloured person becomes bench.
+    roles = {}
+    for f in range(60):
+        # 6 field players inside the court, all moving each frame.
+        field = [_moving_track(10 + i, 200 + 50 * i + (f % 5) * 6, 250) for i in range(6)]
+        ref = _track(3, 600, 800)     # off-court, stationary
+        bench = _track(2, 100, 800)   # off-court, stationary
+        tracks = field + [ref, bench]
 
-    # Enough field players so the outlier threshold is estimated.
-    field_extra = [_track(10 + i, 100 + 50 * i, 250) for i in range(6)]
-    tracks = [on, bench, ref] + field_extra
+        team_map = {t.track_id: 0 for t in tracks}
+        dist_map = {t.track_id: 1.0 for t in tracks}
+        dist_map[ref.track_id] = 100.0  # colour outlier
+        roles = rc.classify(tracks, team_map, dist_map)
 
-    team_map = {t.track_id: 0 for t in tracks}
-    # Field players close to team colour (d≈1); referee far (d=100); bench team (d≈1).
-    dist_map = {t.track_id: 1.0 for t in tracks}
-    dist_map[ref.track_id] = 100.0
-    dist_map[bench.track_id] = 1.0
+    assert roles[10] == "field"          # a moving on-court player
+    assert roles[3] == "referee"          # stationary off-court colour outlier
+    assert roles[2] == "bench"            # stationary off-court team colour
 
-    roles = rc.classify(tracks, team_map, dist_map)
-    assert roles[on.track_id] == "field"
-    assert roles[ref.track_id] == "referee"
-    assert roles[bench.track_id] == "bench"
+
+def test_role_classifier_defers_until_enough_frames():
+    try:
+        from alt_pix.court import CourtCalibration
+        from alt_pix.participation import ParticipationTracker
+        from alt_pix.roles import RoleClassifier
+    except Exception as e:  # pragma: no cover
+        print(f"SKIP defer test (cv2 unavailable): {e!r}")
+        return
+    court = CourtCalibration(corners=[(0, 0), (1000, 0), (1000, 500), (0, 500)])
+    rc = RoleClassifier(court, participation=ParticipationTracker(court, min_frames=30))
+    tracks = [_track(1, 500, 250)]
+    roles = rc.classify(tracks, {1: 0}, {})
+    assert roles[1] == "off"  # not enough history yet
 
 
 def _run_all() -> None:

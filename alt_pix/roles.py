@@ -1,26 +1,27 @@
 """Role classification: field player / bench / referee / unknown.
 
 Rationale (CLAUDE.md Phase 4, docs/phase4_player_perception.md):
-  - Framing and analytics both need to ignore people who are *on screen* but not
-    *in play*: substitutes on the bench, referees, line judges, ball kids.
-  - There is no commercial turnkey model that labels these roles, and OCR/ReID
-    cannot solve it either. The universal signal is geometric + chromatic:
+  Framing and analytics both need to ignore people who are *on screen* but not
+  *in play*: substitutes, referees, line judges, bystanders caught on camera.
 
-      (c) court geometry  → on-court vs off-court  (primary axis)
-      (b) colour outlier  → referee vs bench        (auxiliary axis)
+  2026-06 redesign (evaluation #4): position alone cannot do this in volleyball
+  — the server legally steps off court (and is the key person to keep framed),
+  and the 1st/2nd referees stand at the net centre. So the primary axis is now
+  TEMPORAL PARTICIPATION (see participation.py): integrated over the game, a
+  player has a high on-court fraction and large movement; a line judge / bench /
+  bystander does not. Position is no longer a hard gate but one of the
+  accumulated features (with the serve handled implicitly by time integration).
 
-  This is robust to camera/venue changes: recalibrating the 4 court corners is
-  enough, and the colour outlier is relative to the two team clusters actually
-  present (no per-venue training).
+Decision (once a track has enough history):
+  participating (score >= threshold)  → "field"
+  not participating + team-coloured    → "bench"   (substitute in team kit)
+  not participating + colour outlier    → "referee" (non-player: ref/line/bystander)
+  not participating + no colour signal  → "referee" (coarse non-player bucket)
+  too few frames so far                 → "off"     (defer until evidence builds)
 
-Decision table:
-  on-court                         → "field"
-  off-court + team-coloured        → "bench"   (substitute in team kit)
-  off-court + colour outlier       → "referee" (neither team's uniform)
-  off-court + team clusters unknown → "off"     (warm-up; defer the split)
-
-The referee/bench split needs the TeamClassifier centroids, so during the
-team-classifier warm-up we emit the coarse "off" label rather than guess.
+The bench/referee split needs a uniform-colour signal (dist_map). Without it
+(e.g. court-half team assignment carries no colour), non-players land in the
+coarse "referee" bucket — acceptable for framing, where both are deprioritised.
 """
 
 from __future__ import annotations
@@ -31,30 +32,37 @@ from typing import Literal
 import numpy as np
 
 from .court import CourtCalibration
+from .participation import ParticipationTracker
 from .tracker import Track
 
 logger = logging.getLogger(__name__)
 
 Role = Literal["field", "bench", "referee", "off", "unknown"]
 
-# A person is flagged a colour outlier (referee) when their distance to the
-# nearest team centroid exceeds OUTLIER_K times the robust spread of the
-# on-court players' distances. Robust (median/MAD) so a couple of referees do
-# not inflate the threshold.
+# A non-participant is split bench vs referee by colour: distance to the nearest
+# team centroid above OUTLIER_K robust spreads of the field players' distances
+# marks a colour outlier (referee). Robust (median/MAD) so a few referees do not
+# inflate the threshold.
 _OUTLIER_K = 3.0
-_MIN_REF_SAMPLES = 6  # need enough field players to estimate the spread
+_MIN_REF_SAMPLES = 6
 
 
 class RoleClassifier:
-    """Assign a play-role to each track from court geometry + team-colour outliers.
+    """Assign a play-role from accumulated participation + a colour outlier split.
 
-    Stateless per call except for an EMA of the outlier threshold, which keeps
-    the referee/bench boundary stable across frames instead of flickering.
+    Stateful: owns a ParticipationTracker (per-track evidence over the game) and
+    an EMA of the referee colour-outlier threshold so the boundary stays stable.
     """
 
-    def __init__(self, court: CourtCalibration, field_margin: float = 60.0) -> None:
+    def __init__(
+        self,
+        court: CourtCalibration,
+        field_margin: float = 60.0,
+        participation: ParticipationTracker | None = None,
+    ) -> None:
         self._court = court
         self._field_margin = field_margin
+        self._part = participation or ParticipationTracker(court)
         self._thresh_ema: float | None = None
         self._last_reasons: dict[int, str] = {}
 
@@ -63,21 +71,35 @@ class RoleClassifier:
         """{track_id: human-readable reason} from the most recent classify()."""
         return self._last_reasons
 
-    def _update_threshold(self, field_dists: list[float]) -> float | None:
-        """Robust outlier threshold from the colour-distance of on-court players.
+    @property
+    def participation(self) -> ParticipationTracker:
+        return self._part
 
-        On-court players are (almost) all in team kit, so their distance-to-team
-        distribution defines "normal"; a referee sits well above it.
+    def _appear_match_from_dist(
+        self, tracks: list[Track], dist_map: dict[int, float]
+    ) -> dict[int, float] | None:
+        """Map colour distance-to-team into a [0,1] uniform-match score.
+
+        Uses the robust spread of all tracks' distances this frame; close to a
+        team centroid → ~1 (looks like a uniform), far → ~0 (colour outlier).
+        Returns None when there is no usable colour signal.
         """
-        if len(field_dists) < _MIN_REF_SAMPLES:
-            return self._thresh_ema  # not enough signal; reuse last estimate
-        arr = np.asarray(field_dists, dtype=np.float64)
+        vals = [dist_map[t.track_id] for t in tracks
+                if t.track_id in dist_map and np.isfinite(dist_map[t.track_id])]
+        if len(vals) < _MIN_REF_SAMPLES:
+            return None
+        arr = np.asarray(vals, dtype=np.float64)
         med = float(np.median(arr))
         mad = float(np.median(np.abs(arr - med))) + 1e-6
-        thr = med + _OUTLIER_K * 1.4826 * mad  # 1.4826 → MAD≈σ for normal data
-        # EMA-smooth so the boundary does not jump frame to frame.
-        self._thresh_ema = thr if self._thresh_ema is None else 0.9 * self._thresh_ema + 0.1 * thr
-        return self._thresh_ema
+        scale = _OUTLIER_K * 1.4826 * mad
+        out: dict[int, float] = {}
+        for t in tracks:
+            d = dist_map.get(t.track_id)
+            if d is None or not np.isfinite(d):
+                continue
+            # match = 1 at/below median, decaying to 0 by med + scale.
+            out[t.track_id] = float(np.clip(1.0 - max(0.0, d - med) / max(scale, 1e-6), 0.0, 1.0))
+        return out
 
     def classify(
         self,
@@ -89,44 +111,56 @@ class RoleClassifier:
 
         Args:
             tracks:   active player tracks.
-            team_map: {track_id: team 0/1 or -1} from TeamClassifier.
+            team_map: {track_id: team 0/1 or -1} (used only for the bench split).
             dist_map: {track_id: colour distance to nearest team centroid}.
-                      Empty during team-classifier warm-up.
+                      Empty when team assignment carries no colour (court-half).
         """
-        on_court = {t.track_id: self._court.is_on_court(t.bbox, self._field_margin)
-                    for t in tracks}
+        appear_match = self._appear_match_from_dist(tracks, dist_map) if dist_map else None
+        states = self._part.update(tracks, appear_match)
 
-        # Estimate the referee threshold from on-court players' colour distances.
-        field_dists = [dist_map[t.track_id] for t in tracks
-                       if on_court[t.track_id] and t.track_id in dist_map
-                       and np.isfinite(dist_map[t.track_id])]
-        thr = self._update_threshold(field_dists)
+        # Referee colour threshold from non-participating, off-court colour dists.
+        ref_dists = [dist_map[t.track_id] for t in tracks
+                     if t.track_id in dist_map and np.isfinite(dist_map.get(t.track_id, np.nan))]
+        thr = self._update_threshold(ref_dists)
 
         roles: dict[int, Role] = {}
         reasons: dict[int, str] = {}
         for t in tracks:
             tid = t.track_id
-            fd = self._court.foot_distance(t.bbox)
-            if on_court[tid]:
-                roles[tid] = "field"
-                reasons[tid] = f"on-court (foot {fd:+.0f}px >= -{self._field_margin:.0f}) -> field"
-                continue
-            # Off-court: split bench vs referee by colour outlier when possible.
-            d = dist_map.get(tid)
-            if team_map.get(tid, -1) < 0 or d is None or not np.isfinite(d) or thr is None:
+            st = states.get(tid)
+            expl = self._part.explain(tid)
+
+            if st is None or st.frames < self._part.min_frames:
                 roles[tid] = "off"
-                reasons[tid] = f"off-court (foot {fd:+.0f}px); no colour signal -> off"
-            elif d > thr:
-                roles[tid] = "referee"
-                reasons[tid] = (
-                    f"off-court (foot {fd:+.0f}px) + colour outlier "
-                    f"(d={d:.3f} > thr={thr:.3f}) -> referee"
-                )
-            else:
+                reasons[tid] = f"gathering evidence -> off [{expl}]"
+                continue
+
+            if st.score >= self._part.player_threshold:
+                roles[tid] = "field"
+                reasons[tid] = f"participating -> field [{expl}]"
+                continue
+
+            # Non-participant: split bench (team colour) vs referee (outlier/none).
+            d = dist_map.get(tid)
+            if team_map.get(tid, -1) >= 0 and d is not None and np.isfinite(d) and thr is not None and d <= thr:
                 roles[tid] = "bench"
-                reasons[tid] = (
-                    f"off-court (foot {fd:+.0f}px) + team colour "
-                    f"(d={d:.3f} <= thr={thr:.3f}) -> bench"
-                )
+                reasons[tid] = f"not participating + team colour (d={d:.3f}<=thr={thr:.3f}) -> bench [{expl}]"
+            else:
+                roles[tid] = "referee"
+                why = (f"colour outlier d={d:.3f}>thr={thr:.3f}"
+                       if (d is not None and np.isfinite(d) and thr is not None)
+                       else "no colour signal")
+                reasons[tid] = f"not participating + {why} -> referee [{expl}]"
+
         self._last_reasons = reasons
         return roles
+
+    def _update_threshold(self, dists: list[float]) -> float | None:
+        if len(dists) < _MIN_REF_SAMPLES:
+            return self._thresh_ema
+        arr = np.asarray(dists, dtype=np.float64)
+        med = float(np.median(arr))
+        mad = float(np.median(np.abs(arr - med))) + 1e-6
+        thr = med + _OUTLIER_K * 1.4826 * mad
+        self._thresh_ema = thr if self._thresh_ema is None else 0.9 * self._thresh_ema + 0.1 * thr
+        return self._thresh_ema
