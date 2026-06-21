@@ -140,4 +140,5 @@ output_aspect でリサイズした仮想カメラ映像を書き出す。本フ
 | `alt_pix/framing.py` | `FramingCalculator`（加重合成＋pan/zoom分離平滑化＋ゲートゲーティング） |
 | `scripts/run_pipeline.py` | `game_active` を framing へ結線、ROI を DEBUG ログへ |
 | `scripts/eval_framing.py` | JSONL から framing 品質指標を算出（再現可能評価） |
+| `scripts/render_framed.py` | JSONL の ROI で実映像をクロップ・リサイズし仮想カメラ映像を書き出す（出力で目視評価） |
 | `tests/test_framing.py` | 挙動テスト（GPU 不要、7 ケース） |
