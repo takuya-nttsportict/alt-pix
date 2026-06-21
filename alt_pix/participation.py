@@ -49,10 +49,12 @@ class _PartState:
     appear_ema: float | None = None  # EMA of uniform-colour match [0,1] (optional)
     last_foot: tuple[float, float] | None = None
     score: float = 0.0
-    # Grace period: track when person was last on court.
-    frames_since_exit: int = 999    # frames elapsed since leaving the court (999 = never inside)
-    was_on_court: bool = False      # on-court last frame
-    recently_exited: bool = False   # True within grace_frames after leaving court
+    # Asymmetric on/off-court membership (fast-in, slow-out).
+    on_court_now: bool = False      # inside the court THIS frame
+    was_on_court: bool = False      # has ever been inside the court
+    frames_since_exit: int = 999    # frames since last leaving the court (999 = never inside)
+    assume_server: bool = False     # exited across an END line (u-axis) -> likely a server
+    recently_exited: bool = False   # within the (direction-dependent) grace window after exit
 
 
 @dataclass
@@ -82,9 +84,18 @@ class ParticipationTracker:
     w_on_court: float = 0.4
     w_motion: float = 0.3
     w_appearance: float = 0.3
-    grace_frames: int = 45  # frames after leaving court to keep recently_exited=True (~1.5s@30fps)
+    # Asymmetric grace after leaving the court (fast-in / slow-out): only players
+    # ever enter the court, so we keep "field" long after they step out.
+    grace_frames: int = 150          # general exit (sideline / ball chase) ~5s@30fps
+    serve_grace_frames: int = 1800   # END-line exit (assume server) ~60s@30fps
+    # Game-progress: with few people on court the game is paused (timeout / set
+    # break / between rallies with everyone off). Used to gate framing.
+    min_active_on_court: float = 4.0
+    active_alpha: float = 0.05
 
     _states: dict[int, _PartState] = field(default_factory=dict)
+    _on_court_count_ema: float = 0.0
+    _frames_total: int = 0
 
     def update(
         self,
@@ -107,23 +118,32 @@ class ParticipationTracker:
             st.frames += 1
 
             # ── on-court indicator ────────────────────────────────────────────
+            x1, y1, x2, y2 = t.bbox
+            foot = ((x1 + x2) / 2.0, float(y2))
             on_court_now = self.court.is_on_court(t.bbox, self.on_court_margin)
             on = 1.0 if on_court_now else 0.0
             st.on_court_ema += self.alpha * (on - st.on_court_ema)
+            st.on_court_now = on_court_now
 
-            # ── grace period: recently exited court ───────────────────────────
+            # ── asymmetric grace (fast-in / slow-out) ─────────────────────────
+            # Only players enter the court, so when someone steps out we keep
+            # the "field" benefit of the doubt for a while. If they crossed an
+            # END line (court length / u-axis) it is very likely a serve, so the
+            # grace is much longer (assume_server); a sideline exit (ball chase)
+            # gets the shorter general grace.
             if on_court_now:
                 st.frames_since_exit = 0
                 st.was_on_court = True
+                st.assume_server = False
+                st.recently_exited = False
             elif st.was_on_court:
-                # just exited or still off after having been on
+                if st.frames_since_exit == 0:  # the exit frame: classify direction
+                    st.assume_server = self._exited_via_endline(foot)
                 st.frames_since_exit += 1
-            st.recently_exited = (st.frames_since_exit > 0
-                                  and st.frames_since_exit <= self.grace_frames)
+                window = self.serve_grace_frames if st.assume_server else self.grace_frames
+                st.recently_exited = st.frames_since_exit <= window
 
             # ── motion (bbox-height-normalised foot displacement) ─────────────
-            x1, y1, x2, y2 = t.bbox
-            foot = ((x1 + x2) / 2.0, float(y2))
             bh = max(y2 - y1, 1.0)
             if st.last_foot is not None:
                 disp = float(np.hypot(foot[0] - st.last_foot[0],
@@ -142,7 +162,45 @@ class ParticipationTracker:
 
             st.score = self._score(st)
             out[t.track_id] = st
+
+        # ── game-progress: EMA of how many people are currently on court ──────
+        n_on = sum(1 for s in out.values() if s.on_court_now)
+        self._frames_total += 1
+        self._on_court_count_ema += self.active_alpha * (n_on - self._on_court_count_ema)
         return out
+
+    # ── game-progress accessors ──────────────────────────────────────────────
+
+    @property
+    def on_court_count_ema(self) -> float:
+        """Smoothed number of people currently inside the court."""
+        return self._on_court_count_ema
+
+    @property
+    def game_active(self) -> bool:
+        """False when too few people are on court (timeout / set break / dead time).
+
+        Withheld (treated active) until enough frames have been seen to avoid a
+        spurious "paused" verdict during warm-up.
+        """
+        if self._frames_total < self.min_frames:
+            return True
+        return self._on_court_count_ema >= self.min_active_on_court
+
+    def _exited_via_endline(self, foot: tuple[float, float]) -> bool:
+        """True if the foot is outside an END line (u-axis) more than a sideline.
+
+        Court metres: u in [0,18] is the length (end lines at u=0 / u=18, net at
+        u=9); v in [0,9] is the width (sidelines at v=0 / v=9). A serve happens
+        behind an end line, so an exit dominated by the u-axis -> assume server.
+        """
+        try:
+            u, v = self.court.image_to_court(foot[0], foot[1])
+        except Exception:  # pragma: no cover - degenerate homography
+            return False
+        du = max(0.0 - u, u - 18.0, 0.0)   # how far past an end line
+        dv = max(0.0 - v, v - 9.0, 0.0)    # how far past a sideline
+        return du > 0.0 and du >= dv
 
     def _score(self, st: _PartState) -> float:
         motion_score = min(1.0, st.motion_ema / max(self.motion_ref, 1e-6))
@@ -165,6 +223,10 @@ class ParticipationTracker:
             return "no data"
         motion_score = min(1.0, st.motion_ema / max(self.motion_ref, 1e-6))
         ap = f" appear={st.appear_ema:.2f}" if st.appear_ema is not None else ""
-        grace = f" grace={st.frames_since_exit}f" if st.recently_exited else ""
+        if st.recently_exited:
+            tag = "server?" if st.assume_server else "exit"
+            grace = f" {tag}+{st.frames_since_exit}f"
+        else:
+            grace = ""
         return (f"score={st.score:.2f} (oncourt={st.on_court_ema:.2f} "
                 f"motion={motion_score:.2f}{ap}{grace}, n={st.frames})")

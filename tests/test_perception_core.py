@@ -133,9 +133,14 @@ def test_role_classifier_defers_until_enough_frames():
         return
     court = CourtCalibration(corners=[(0, 0), (1000, 0), (1000, 500), (0, 500)])
     rc = RoleClassifier(court, participation=ParticipationTracker(court, min_frames=30))
-    tracks = [_track(1, 500, 250)]
+    # Off-court track (never inside) so fast-in does not apply: deferred to "off".
+    tracks = [_track(1, 600, 900)]
     roles = rc.classify(tracks, {1: 0}, {})
     assert roles[1] == "off"  # not enough history yet
+
+    # An on-court track is judged immediately (fast-in), no warm-up needed.
+    on = rc.classify([_track(2, 500, 250)], {2: 0}, {})
+    assert on[2] == "field"
 
 
 def _run_all() -> None:

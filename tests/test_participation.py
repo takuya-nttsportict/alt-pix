@@ -83,25 +83,37 @@ def test_appearance_signal_folds_in():
     assert 0.0 < st.score < 0.5
 
 
-def test_recently_exited_court_flag():
-    """A player who steps off court should have recently_exited=True for grace_frames."""
+def test_sideline_exit_general_grace():
+    """A player stepping off the SIDELINE (v-axis) gets the shorter grace."""
+    # Court 0..1000px -> u in [0,18]m, v in [0,9]m. y beyond 500px = past sideline.
     pt = ParticipationTracker(_court(), alpha=0.2, min_frames=10, motion_ref=0.04,
-                              grace_frames=30)
-    # Put player on court for a while.
+                              grace_frames=30, serve_grace_frames=300)
     for _ in range(20):
-        pt.update([_track(1, 300, 250)])
-    # Step off court.
+        pt.update([_track(1, 500, 250)])          # on court
     for f in range(15):
-        states = pt.update([_track(1, 300, 800)])
-    st = states[1]
+        st = pt.update([_track(1, 500, 800)])[1]   # off past the sideline (v>9)
     assert st.recently_exited is True
+    assert st.assume_server is False
     assert st.frames_since_exit == 15
-
-    # After grace_frames, recently_exited resets.
-    for _ in range(20):
-        pt.update([_track(1, 300, 800)])
-    st = pt.update([_track(1, 300, 800)])[1]
+    # After the (short) general grace, the flag clears.
+    for _ in range(40):
+        st = pt.update([_track(1, 500, 800)])[1]
     assert st.recently_exited is False
+
+
+def test_endline_exit_assumes_server_long_grace():
+    """A player stepping behind the END line (u-axis) is assumed a server."""
+    pt = ParticipationTracker(_court(), alpha=0.2, min_frames=10, motion_ref=0.04,
+                              grace_frames=30, serve_grace_frames=300)
+    for _ in range(20):
+        pt.update([_track(1, 500, 250)])          # on court
+    # Exit past the end line: x beyond 1000px -> u > 18m.
+    for f in range(50):
+        st = pt.update([_track(1, 1200, 250)])[1]
+    assert st.assume_server is True
+    # Still in grace at 50 frames (>general grace of 30) thanks to serve window.
+    assert st.recently_exited is True
+    assert st.frames_since_exit == 50
 
 
 def test_never_on_court_not_recently_exited():
@@ -109,9 +121,24 @@ def test_never_on_court_not_recently_exited():
     pt = ParticipationTracker(_court(), alpha=0.2, min_frames=10)
     st = None
     for _ in range(40):
-        st = pt.update([_track(9, 600, 800)])[9]
+        st = pt.update([_track(9, 1200, 250)])[9]   # never on court
     assert st.recently_exited is False
     assert st.frames_since_exit == 999
+
+
+def test_game_active_pauses_when_court_empty():
+    """game_active is False once the court holds fewer than min_active players."""
+    pt = ParticipationTracker(_court(), min_frames=10, min_active_on_court=4.0,
+                              active_alpha=0.3)
+    # Busy court: 6 players inside -> active.
+    for _ in range(30):
+        pt.update([_track(i, 200 + 80 * i, 250) for i in range(6)])
+    assert pt.game_active is True
+    assert pt.on_court_count_ema > 4.0
+    # Court empties (timeout): nobody inside.
+    for _ in range(30):
+        pt.update([_track(99, 1200, 250)])   # single off-court bystander
+    assert pt.game_active is False
 
 
 def _run_all() -> None:

@@ -130,6 +130,23 @@ class RoleClassifier:
             st = states.get(tid)
             expl = self._part.explain(tid)
 
+            # Fast-in: only players ever enter the court, so anyone on the court
+            # surface RIGHT NOW is a field player — no warm-up needed (the user's
+            # "judge entering as quickly as possible").
+            if st is not None and st.on_court_now:
+                roles[tid] = "field"
+                reasons[tid] = f"on court now -> field [{expl}]"
+                continue
+
+            # Slow-out: keep "field" long after a player steps out. An end-line
+            # exit is almost certainly a serve (assume_server) and gets a much
+            # longer grace than a sideline ball-chase.
+            if st is not None and st.recently_exited:
+                roles[tid] = "field"
+                tag = "assume server" if st.assume_server else "recently exited court"
+                reasons[tid] = f"{tag} ({st.frames_since_exit}f ago) -> field [{expl}]"
+                continue
+
             if st is None or st.frames < self._part.min_frames:
                 roles[tid] = "off"
                 reasons[tid] = f"gathering evidence -> off [{expl}]"
@@ -138,12 +155,6 @@ class RoleClassifier:
             if st.score >= self._part.player_threshold:
                 roles[tid] = "field"
                 reasons[tid] = f"participating -> field [{expl}]"
-                continue
-
-            # Grace period: person recently stepped off court (server / ball-chaser).
-            if st.recently_exited:
-                roles[tid] = "field"
-                reasons[tid] = f"recently exited court ({st.frames_since_exit}f ago) -> field [{expl}]"
                 continue
 
             # Non-participant: split bench (team colour) vs referee (outlier/none).

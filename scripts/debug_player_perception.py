@@ -112,9 +112,14 @@ def main() -> None:
         n_bench = sum(1 for t in tracks if t.role == "bench")
         n_ref = sum(1 for t in tracks if t.role == "referee")
         n_off = sum(1 for t in tracks if t.role == "off")
+        game = ""
+        if role_clf is not None:
+            part = role_clf.participation
+            game = (f" | {'PLAY' if part.game_active else 'PAUSED'} "
+                    f"oncourt={part.on_court_count_ema:.1f}")
         cv2.putText(vis,
                     f"f={frame_id} tracks={len(tracks)} field={n_field} "
-                    f"bench={n_bench} ref={n_ref} off={n_off} {assigner.method}",
+                    f"bench={n_bench} ref={n_ref} off={n_off} {assigner.method}{game}",
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
         if writer is None:
