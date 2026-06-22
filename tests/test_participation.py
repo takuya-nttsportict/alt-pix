@@ -116,6 +116,20 @@ def test_endline_exit_assumes_server_long_grace():
     assert st.frames_since_exit == 50
 
 
+def test_server_track_id_identifies_endline_exiter():
+    """server_track_id returns the player who stepped behind the end line."""
+    pt = ParticipationTracker(_court(), alpha=0.2, min_frames=10, motion_ref=0.04,
+                              grace_frames=30, serve_grace_frames=300)
+    # Two on-court players; one will go serve.
+    for _ in range(20):
+        pt.update([_track(1, 500, 250), _track(2, 400, 250)])
+    assert pt.server_track_id() is None  # nobody off court yet
+    # Player 1 steps behind the end line (u>18); player 2 stays on court.
+    for _ in range(10):
+        pt.update([_track(1, 1200, 250), _track(2, 400, 250)])
+    assert pt.server_track_id() == 1
+
+
 def test_never_on_court_not_recently_exited():
     """A person who was never inside the court has recently_exited=False."""
     pt = ParticipationTracker(_court(), alpha=0.2, min_frames=10)

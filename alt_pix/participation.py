@@ -190,6 +190,22 @@ class ParticipationTracker:
             return True
         return self._on_court_count_ema >= self.min_active_on_court
 
+    def server_track_id(self) -> int | None:
+        """Track id of the current server, or None.
+
+        The server is the player who most recently stepped behind an end line
+        (assume_server, set on the exit frame). Among such tracks we pick the one
+        with the smallest frames_since_exit (the freshest end-line exit), so a
+        stale grace from an earlier rally does not win. Used by framing to point
+        the camera at the server during SERVICE instead of holding a loose wide.
+        """
+        best_id: int | None = None
+        best_age = 1 << 30
+        for tid, st in self._states.items():
+            if st.assume_server and st.recently_exited and st.frames_since_exit < best_age:
+                best_id, best_age = tid, st.frames_since_exit
+        return best_id
+
     def _score(self, st: _PartState) -> float:
         motion_score = min(1.0, st.motion_ema / max(self.motion_ref, 1e-6))
         comps = [st.on_court_ema, motion_score]

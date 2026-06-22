@@ -73,7 +73,8 @@ _W_BALL_LOST = 0.0
 # ── ROI サイズの制約（フレーム高に対する割合の zoom レベル）──────────────────────
 # 「zoom レベル」は ROI 高 / フレーム高（1.0=フル）。状態ごとの目標 zoom を定義。
 _ZOOM_RALLY = 0.72          # ラリー通常: 中ズーム（全コートが概ね見える）
-_ZOOM_SERVICE = 0.92        # サーブ: 引いてサーバー＋隊形を収める
+_ZOOM_SERVICE = 0.58        # サーブ: サーバーに寄せる中ズーム（ルーズな wide を避ける）
+_ZOOM_SERVICE_NOFOCUS = 0.92  # サーバー位置不明時のフォールバック（従来の wide）
 _ZOOM_NO_PLAY = 0.98        # デッドボール: ほぼフル wide
 _ZOOM_HIGHLIGHT = 0.50      # ズームイン演出時（スパイク等、Phase 6 で発火）
 _MIN_ZOOM = 0.35            # 寄りすぎ下限
@@ -195,11 +196,12 @@ class FramingCalculator:
             lead = lead / n * cap
         return lead
 
-    def _zoom_level(self, game_state: GameState, highlight: bool) -> float:
+    def _zoom_level(self, game_state: GameState, highlight: bool, has_focus: bool) -> float:
         """状態 → 目標 zoom レベル（ROI 高 / フレーム高）。ハイライトで寄る。"""
+        service_zoom = _ZOOM_SERVICE if has_focus else _ZOOM_SERVICE_NOFOCUS
         base = {
             "rally": _ZOOM_RALLY,
-            "service": _ZOOM_SERVICE,
+            "service": service_zoom,
             "no_play": _ZOOM_NO_PLAY,
         }.get(game_state, _ZOOM_RALLY)
         # ハイライト・エンベロープを更新（寄り→保持→戻しの滑らかな係数）。
@@ -213,11 +215,13 @@ class FramingCalculator:
         return float(np.clip(z, _MIN_ZOOM, _MAX_ZOOM))
 
     def _target(
-        self, ball: BallState, tracks: list[Track], game_state: GameState, highlight: bool,
+        self, ball: BallState, tracks: list[Track], game_state: GameState,
+        highlight: bool, focus_xy: tuple[float, float] | None,
     ) -> tuple[np.ndarray, np.ndarray]:
         """生ターゲット（center[2], size[2]）。スプリング前。"""
         players = self._players_box(tracks)
-        zoom = self._zoom_level(game_state, highlight)
+        has_focus = game_state == "service" and focus_xy is not None
+        zoom = self._zoom_level(game_state, highlight, has_focus)
         size_h = zoom * self._fh
         size_w = size_h * self._aspect
         size = np.array([size_w, size_h], dtype=np.float64)
@@ -229,6 +233,11 @@ class FramingCalculator:
             else:
                 cx, cy = self._fw / 2, self._fh / 2
             return np.array([cx, cy]), size
+
+        # SERVICE: サーバー（assume_server）が分かればそこへ寄せる。サーブ時に
+        # ルーズなコート全体だと違和感が強いので、サーバー中心の中ズームを優先する。
+        if has_focus and focus_xy is not None:
+            return np.array([focus_xy[0], focus_xy[1]], dtype=np.float64), size
 
         if game_state == "no_play":
             # パン凍結: 既存中心を維持（出入りを追わない）。初期は選手 or 画面中央。
@@ -279,6 +288,7 @@ class FramingCalculator:
         tracks: list[Track],
         game_state: GameState = "rally",
         highlight: bool = False,
+        focus_xy: tuple[float, float] | None = None,
     ) -> ROI:
         """このフレームの平滑化済み ROI を返す。
 
@@ -287,8 +297,10 @@ class FramingCalculator:
             tracks:     framing 対象の field 選手トラック。
             game_state: "rally" / "service" / "no_play"（game_state.py が供給）。
             highlight:  ズームイン演出のトリガ（スパイク等; 現状プレースホルダ）。
+            focus_xy:   SERVICE 時に優先して寄せる点（サーバー位置 [px]）。
+                        与えられれば SERVICE はルーズな wide でなくサーバー中ズーム。
         """
-        target_c, target_s = self._target(ball, tracks, game_state, highlight)
+        target_c, target_s = self._target(ball, tracks, game_state, highlight, focus_xy)
 
         if self._center is None:
             self._center = target_c.copy()

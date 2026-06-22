@@ -269,11 +269,20 @@ def main() -> None:
 
             # ── Framing ───────────────────────────────────────────────────────
             # State-aware camera work: RALLY follows ball+players at mid zoom;
-            # SERVICE pulls wide to the server's endline; NO_PLAY (timeout / set
-            # break) freezes the pan and holds a wide shot. Critically-damped
-            # spring smoothing inside FramingCalculator removes the EMA jitter.
+            # SERVICE points at the server (assume_server) at a mid zoom rather
+            # than a loose wide; NO_PLAY (timeout / set break) freezes the pan and
+            # holds a wide shot. Critically-damped spring smoothing removes jitter.
             game_state = game_state_est.update(ball_state, field_tracks)
-            roi = framing.compute(ball_state, field_tracks, game_state=game_state)
+            focus_xy = None
+            if game_state == "service" and role_clf is not None:
+                sid = role_clf.participation.server_track_id()
+                if sid is not None:
+                    st = next((t for t in tracks if t.track_id == sid), None)
+                    if st is not None:
+                        x1, _y1, x2, y2 = st.bbox
+                        focus_xy = ((x1 + x2) / 2.0, float(y2))  # server's feet
+            roi = framing.compute(ball_state, field_tracks,
+                                  game_state=game_state, focus_xy=focus_xy)
 
             # ── Output ────────────────────────────────────────────────────────
             record = _make_record(frame_id, ts * 1000, ball_state, tracks, jersey_map, roi)
