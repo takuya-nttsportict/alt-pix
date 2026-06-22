@@ -94,6 +94,20 @@ zoom レベル = ROI 高 / フレーム高。状態遷移は `_SWITCH_HYSTERESIS
 確実なサーブ・デッドボール検出には action recognition（Phase 6）が要る。framing は
 状態 enum にのみ依存するので、将来推定器を差し替えても影響しない。
 
+### 4.2.5 撮り味プロファイル（normal / dynamic）
+有人カメラの実映像はより**ダイナミック**（寄りが強い・ボール追従が速い・リード
+ルームが大きい）。これを `FramingProfile` として束ね、`--framing-style` で切替:
+
+| プロファイル | 性格 | 主な違い |
+|---|---|---|
+| `normal`（既定） | 放送的・安定。揺れを抑えゆったり追う | pan 0.9s / zoom 1.6s / ball 0.45 / rally zoom 0.72 / service zoom 0.58 |
+| `dynamic` | 有人カメラ的。寄り強め・機敏 | pan 0.55s / zoom 1.1s / ball 0.68 / rally zoom 0.55 / service zoom 0.46 / lead 0.30 / 決定機 zoom 0.38 / min zoom 0.28 |
+
+両者ともゲーム状態認識・サーバー端寄せ（SERVICE ではサーバーをフレーム端に置き
+コート側へ空間を確保）・臨界制動スプリングの土台は共有し、時定数・ボール重み・
+zoom 目標・リードルームの**ダイヤルだけ**を差し替える。プロファイルは
+`alt_pix/framing.py` の `PROFILES` に定義（追加も容易）。
+
 ### 4.3 リードルーム
 ボール進行方向（水平主体・垂直 ×0.3）へ中心を `_LEAD_GAIN=0.18` でオフセット
 （上限 `_LEAD_MAX_FRAC=0.12`）。バレーは pan 優先のため水平を主とする。

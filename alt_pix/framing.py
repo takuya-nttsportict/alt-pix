@@ -83,6 +83,78 @@ _MAX_ZOOM = 1.00
 _WIDE_MARGIN = 0.12         # 選手包含 BBox へのパディング（包含サイズ比）
 # ハイライト・エンベロープの増減速度（1 フレームあたりの zoom 係数変化）。
 _HIGHLIGHT_RATE = 0.04
+_EDGE_MARGIN = 0.08         # SERVICE 時、サーバーをフレーム端から何割の余白に置くか
+
+
+@dataclass(frozen=True)
+class FramingProfile:
+    """フレーミングの調律プロファイル（撮り味）。
+
+    `normal`（放送的・安定）と `dynamic`（有人カメラ的・寄りが強く機敏）の
+    2 種を用意。pan/zoom の時定数、ボール重み、リードルーム、各状態の zoom 目標を
+    束ねて切り替える。値の意味は上のモジュール定数のコメント参照。
+    """
+
+    pan_smooth_time: float
+    zoom_smooth_time: float
+    max_pan_speed_frac: float
+    lead_gain: float
+    lead_max_frac: float
+    w_ball_visible: float
+    w_ball_predicted: float
+    zoom_rally: float
+    zoom_service: float
+    zoom_service_nofocus: float
+    zoom_no_play: float
+    zoom_highlight: float
+    min_zoom: float
+    highlight_rate: float
+    edge_margin: float
+
+
+# normal: 現状の放送的・安定志向（揺れを抑え、ゆったり追う）。
+NORMAL_PROFILE = FramingProfile(
+    pan_smooth_time=_PAN_SMOOTH_TIME,
+    zoom_smooth_time=_ZOOM_SMOOTH_TIME,
+    max_pan_speed_frac=_MAX_PAN_SPEED_FRAC,
+    lead_gain=_LEAD_GAIN,
+    lead_max_frac=_LEAD_MAX_FRAC,
+    w_ball_visible=_W_BALL_VISIBLE,
+    w_ball_predicted=_W_BALL_PREDICTED,
+    zoom_rally=_ZOOM_RALLY,
+    zoom_service=_ZOOM_SERVICE,
+    zoom_service_nofocus=_ZOOM_SERVICE_NOFOCUS,
+    zoom_no_play=_ZOOM_NO_PLAY,
+    zoom_highlight=_ZOOM_HIGHLIGHT,
+    min_zoom=_MIN_ZOOM,
+    highlight_rate=_HIGHLIGHT_RATE,
+    edge_margin=_EDGE_MARGIN,
+)
+
+# dynamic: 有人カメラ的。寄りを強く（zoom 小さめ）、ボール追従を速く・強く、
+# リードルームを大きく取り、pan を機敏に。決定機の寄りも深く。
+DYNAMIC_PROFILE = FramingProfile(
+    pan_smooth_time=0.55,        # より機敏に追う
+    zoom_smooth_time=1.1,        # ズームもやや速く反応
+    max_pan_speed_frac=1.0,      # 速い動きに付いていける上限
+    lead_gain=0.30,              # 進行方向へ大きく先行
+    lead_max_frac=0.20,
+    w_ball_visible=0.68,         # ボール主導で振る（選手集団より前へ）
+    w_ball_predicted=0.40,
+    zoom_rally=0.55,             # ラリーから寄り気味
+    zoom_service=0.46,           # サーブはぐっと寄る
+    zoom_service_nofocus=0.80,
+    zoom_no_play=0.95,
+    zoom_highlight=0.38,         # 決定機は深く寄る
+    min_zoom=0.28,               # 寄りすぎ下限も深く
+    highlight_rate=0.06,
+    edge_margin=0.06,
+)
+
+PROFILES: dict[str, FramingProfile] = {
+    "normal": NORMAL_PROFILE,
+    "dynamic": DYNAMIC_PROFILE,
+}
 
 
 def _smooth_damp(
@@ -134,18 +206,26 @@ class FramingCalculator:
         output_aspect: float = 16 / 9,
         mode: str = "auto",
         fps: float = 30.0,
-        pan_smooth_time: float = _PAN_SMOOTH_TIME,
-        zoom_smooth_time: float = _ZOOM_SMOOTH_TIME,
-        max_pan_speed_frac: float = _MAX_PAN_SPEED_FRAC,
+        style: str = "normal",
+        pan_smooth_time: float | None = None,
+        zoom_smooth_time: float | None = None,
+        max_pan_speed_frac: float | None = None,
     ) -> None:
         self._fw = frame_w
         self._fh = frame_h
         self._aspect = output_aspect
         self._mode = mode  # 'auto'（状態認識）/'ball'/'wide'（手動上書き）
         self._dt = 1.0 / max(fps, 1e-3)
-        self._pan_t = pan_smooth_time
-        self._zoom_t = zoom_smooth_time
-        self._max_pan_speed = max_pan_speed_frac * frame_w
+        if style not in PROFILES:
+            raise ValueError(f"unknown framing style {style!r}; "
+                             f"choices: {sorted(PROFILES)}")
+        self._style = style
+        self._p = PROFILES[style]
+        # 個別上書き（None なら profile の値）。
+        self._pan_t = self._p.pan_smooth_time if pan_smooth_time is None else pan_smooth_time
+        self._zoom_t = self._p.zoom_smooth_time if zoom_smooth_time is None else zoom_smooth_time
+        mpsf = self._p.max_pan_speed_frac if max_pan_speed_frac is None else max_pan_speed_frac
+        self._max_pan_speed = mpsf * frame_w
 
         # スプリング状態（位置＋速度）。
         self._center: np.ndarray | None = None
@@ -175,7 +255,7 @@ class FramingCalculator:
     def _ball_weight(self, ball: BallState) -> float:
         if not ball.visible:
             return _W_BALL_LOST
-        return _W_BALL_PREDICTED if ball.predicted else _W_BALL_VISIBLE
+        return self._p.w_ball_predicted if ball.predicted else self._p.w_ball_visible
 
     def _lead_room(self, ball: BallState) -> np.ndarray:
         """ボール進行方向（水平主体）への先行オフセット。"""
@@ -189,8 +269,8 @@ class FramingCalculator:
         vel = cur - self._ball_prev
         self._ball_prev = cur
         # バレーは pan 優先 → 水平を主に、垂直は控えめ（×0.3）。
-        lead = np.array([vel[0], vel[1] * 0.3]) * _LEAD_GAIN
-        cap = _LEAD_MAX_FRAC * self._fw
+        lead = np.array([vel[0], vel[1] * 0.3]) * self._p.lead_gain
+        cap = self._p.lead_max_frac * self._fw
         n = float(np.linalg.norm(lead))
         if n > cap:
             lead = lead / n * cap
@@ -198,21 +278,21 @@ class FramingCalculator:
 
     def _zoom_level(self, game_state: GameState, highlight: bool, has_focus: bool) -> float:
         """状態 → 目標 zoom レベル（ROI 高 / フレーム高）。ハイライトで寄る。"""
-        service_zoom = _ZOOM_SERVICE if has_focus else _ZOOM_SERVICE_NOFOCUS
+        service_zoom = self._p.zoom_service if has_focus else self._p.zoom_service_nofocus
         base = {
-            "rally": _ZOOM_RALLY,
+            "rally": self._p.zoom_rally,
             "service": service_zoom,
-            "no_play": _ZOOM_NO_PLAY,
-        }.get(game_state, _ZOOM_RALLY)
+            "no_play": self._p.zoom_no_play,
+        }.get(game_state, self._p.zoom_rally)
         # ハイライト・エンベロープを更新（寄り→保持→戻しの滑らかな係数）。
         tgt = 1.0 if highlight else 0.0
         if self._highlight_env < tgt:
-            self._highlight_env = min(tgt, self._highlight_env + _HIGHLIGHT_RATE)
+            self._highlight_env = min(tgt, self._highlight_env + self._p.highlight_rate)
         else:
-            self._highlight_env = max(tgt, self._highlight_env - _HIGHLIGHT_RATE)
+            self._highlight_env = max(tgt, self._highlight_env - self._p.highlight_rate)
         # エンベロープで base と highlight zoom を補間。
-        z = base + (_ZOOM_HIGHLIGHT - base) * self._highlight_env
-        return float(np.clip(z, _MIN_ZOOM, _MAX_ZOOM))
+        z = base + (self._p.zoom_highlight - base) * self._highlight_env
+        return float(np.clip(z, self._p.min_zoom, _MAX_ZOOM))
 
     def _target(
         self, ball: BallState, tracks: list[Track], game_state: GameState,
@@ -241,14 +321,14 @@ class FramingCalculator:
         if has_focus and focus_xy is not None:
             sx = float(focus_xy[0])
             sy = float(focus_xy[1])
-            _EDGE_MARGIN = 0.08   # サーバーをフレーム端から何割の余白に置くか
+            edge = self._p.edge_margin   # サーバーをフレーム端から何割の余白に置くか
             half_w = size[0] / 2.0
             if sx < self._fw / 2:
                 # 左サーバー: ROI 中心をサーバーの右側へ（サーバーを左端に）
-                cx = sx + half_w * (1.0 - _EDGE_MARGIN * 2)
+                cx = sx + half_w * (1.0 - edge * 2)
             else:
                 # 右サーバー: ROI 中心をサーバーの左側へ（サーバーを右端に）
-                cx = sx - half_w * (1.0 - _EDGE_MARGIN * 2)
+                cx = sx - half_w * (1.0 - edge * 2)
             return np.array([cx, sy], dtype=np.float64), size
 
         if game_state == "no_play":
@@ -277,8 +357,8 @@ class FramingCalculator:
 
     def _clamp_roi(self, cx: float, cy: float, w: float, h: float) -> ROI:
         """アスペクト維持・最小/最大・フレーム内クランプ。境界後にアスペクト再適用。"""
-        w = float(np.clip(w, self._fw * _MIN_ZOOM * self._aspect, self._fw))
-        h = float(np.clip(h, self._fh * _MIN_ZOOM, self._fh))
+        w = float(np.clip(w, self._fw * self._p.min_zoom * self._aspect, self._fw))
+        h = float(np.clip(h, self._fh * self._p.min_zoom, self._fh))
         if w / h > self._aspect:
             h = w / self._aspect
         else:

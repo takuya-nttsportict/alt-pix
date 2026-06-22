@@ -164,6 +164,30 @@ def test_service_focuses_on_server():
     assert w_focus < w_wide, "server focus should be tighter than loose wide"
 
 
+def test_dynamic_style_is_tighter_and_more_ball_driven():
+    """dynamic style frames tighter (smaller ROI) and leans harder on the ball."""
+    players = _players(500)  # players left
+    fr_n = FramingCalculator(_FW, _FH, mode="auto", style="normal")
+    fr_d = FramingCalculator(_FW, _FH, mode="auto", style="dynamic")
+    wn = wd = cn = cd = 0.0
+    for _ in range(150):
+        rn = fr_n.compute(_ball(1500, 400), players, game_state="rally")
+        rd = fr_d.compute(_ball(1500, 400), players, game_state="rally")
+        wn, cn = rn.w, _roi_center(rn)[0]
+        wd, cd = rd.w, _roi_center(rd)[0]
+    assert wd < wn, f"dynamic ({wd}) should be tighter than normal ({wn})"
+    # Ball sits right of the players; dynamic should pull further toward it.
+    assert cd > cn, f"dynamic should lean harder on the ball (cd={cd:.0f}, cn={cn:.0f})"
+
+
+def test_unknown_style_rejected():
+    try:
+        FramingCalculator(_FW, _FH, style="cinematic")
+    except ValueError:
+        return
+    raise AssertionError("unknown style should raise ValueError")
+
+
 def _run_all() -> None:
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

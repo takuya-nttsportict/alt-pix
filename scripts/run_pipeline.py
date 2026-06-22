@@ -95,6 +95,8 @@ def parse_args() -> argparse.Namespace:
 
     # Framing
     p.add_argument("--framing-mode", choices=["auto", "ball", "wide"], default="auto")
+    p.add_argument("--framing-style", choices=["normal", "dynamic"], default="normal",
+                   help="normal=放送的で安定。dynamic=有人カメラ的に寄り強め・機敏。")
 
     # Output
     p.add_argument("--out-json",  default=None, help="Output JSONL log path")
@@ -218,8 +220,9 @@ def main() -> None:
             h, w = frame.shape[:2]
 
             if framing is None:
-                framing = FramingCalculator(w, h, mode=args.framing_mode)
-                logger.info(f"First frame: {w}x{h}")
+                framing = FramingCalculator(w, h, mode=args.framing_mode,
+                                            style=args.framing_style)
+                logger.info(f"First frame: {w}x{h} (framing style={args.framing_style})")
             if video_writer is None and args.out_video:
                 video_writer = VideoWriter(args.out_video, fps=30.0, size=(w, h))
 
