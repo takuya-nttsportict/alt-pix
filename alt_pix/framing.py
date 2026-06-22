@@ -234,10 +234,22 @@ class FramingCalculator:
                 cx, cy = self._fw / 2, self._fh / 2
             return np.array([cx, cy]), size
 
-        # SERVICE: サーバー（assume_server）が分かればそこへ寄せる。サーブ時に
-        # ルーズなコート全体だと違和感が強いので、サーバー中心の中ズームを優先する。
+        # SERVICE: サーバー（assume_server）をフレームの「コート側の端」に置く。
+        # 中央に置くとサーバー背後の壁が半分を占めて無駄になる。
+        # サーバーが画面左半分 → サーバーをフレーム左端付近に配置（コートが右に広がる）。
+        # サーバーが画面右半分 → サーバーをフレーム右端付近に配置（コートが左に広がる）。
         if has_focus and focus_xy is not None:
-            return np.array([focus_xy[0], focus_xy[1]], dtype=np.float64), size
+            sx = float(focus_xy[0])
+            sy = float(focus_xy[1])
+            _EDGE_MARGIN = 0.08   # サーバーをフレーム端から何割の余白に置くか
+            half_w = size[0] / 2.0
+            if sx < self._fw / 2:
+                # 左サーバー: ROI 中心をサーバーの右側へ（サーバーを左端に）
+                cx = sx + half_w * (1.0 - _EDGE_MARGIN * 2)
+            else:
+                # 右サーバー: ROI 中心をサーバーの左側へ（サーバーを右端に）
+                cx = sx - half_w * (1.0 - _EDGE_MARGIN * 2)
+            return np.array([cx, sy], dtype=np.float64), size
 
         if game_state == "no_play":
             # パン凍結: 既存中心を維持（出入りを追わない）。初期は選手 or 画面中央。

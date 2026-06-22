@@ -146,19 +146,21 @@ def test_rally_ball_leans_off_player_centroid():
 
 
 def test_service_focuses_on_server():
-    """SERVICE with a server focus point centres on it and zooms tighter."""
+    """SERVICE with left-side server: server at left edge, court fills right side."""
     players = _players(960)  # team regrouped centre-court
     server = (300.0, 620.0)  # server stands left, behind the end line
     fr_focus = FramingCalculator(_FW, _FH, mode="auto")
     fr_wide = FramingCalculator(_FW, _FH, mode="auto")
-    cx = w_focus = w_wide = 0.0
+    cx = roi_x = w_focus = w_wide = 0.0
     for _ in range(150):
         roi_f = fr_focus.compute(_ball(960, 400), players,
                                  game_state="service", focus_xy=server)
         roi_w = fr_wide.compute(_ball(960, 400), players, game_state="service")
-        cx, w_focus = _roi_center(roi_f)[0], roi_f.w
+        cx, roi_x, w_focus = _roi_center(roi_f)[0], float(roi_f.x), roi_f.w
         w_wide = roi_w.w
-    assert cx < 600, f"camera did not move to the server (cx={cx:.0f})"
+    # Left-side server: ROI left edge should be near the server, center to its right.
+    assert roi_x < 350, f"server not at left edge of frame (roi.x={roi_x:.0f})"
+    assert cx > server[0], f"ROI center should be right of server (cx={cx:.0f})"
     assert w_focus < w_wide, "server focus should be tighter than loose wide"
 
 
